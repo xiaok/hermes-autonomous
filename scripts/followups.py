@@ -15,6 +15,7 @@ due [--at ISO]         only those whose revisit_at has arrived
 checked ID [--snooze ISO]  mark "already looked at it"; optional next revisit
 close ID [--note S]    retire it for good
 watermark [--set ISO]  read or set the message cursor
+apply [--file F]       write back a whole review run (JSON, stdin by default) in one transaction
 """
 
 from __future__ import annotations
@@ -172,10 +173,12 @@ def _set_wm(conn, ts: float) -> None:
     )
 
 
-def _messages_since(since: float) -> list[dict]:
+def _messages_since(since: float) -> tuple[list[dict], float | None]:
+    """Owner messages after ``since``, plus the raw timestamp of the last one
+    returned (None if none) — the exact cursor the next apply should store."""
     state = Path(os.environ.get("HERMES_HOME") or (Path.home() / ".hermes")) / "state.db"
     if not state.exists():
-        return []
+        return [], None
     c = sqlite3.connect(f"file:{state}?mode=ro", uri=True, timeout=30)
     c.row_factory = sqlite3.Row
     rows = c.execute(
@@ -193,10 +196,12 @@ def _messages_since(since: float) -> list[dict]:
         (since, owner_id()),
     ).fetchall()
     out = []
+    last_ts = None
     for r in rows:
         text = (r["content"] or "").strip()
         if any(text.startswith(n) for n in NOISE):
             continue
+        last_ts = r["timestamp"]
         out.append(
             {
                 "t": _iso(r["timestamp"]),
@@ -209,16 +214,16 @@ def _messages_since(since: float) -> list[dict]:
     # which is where the live threads are.
     if len(out) > MAX_MESSAGES:
         out = out[-MAX_MESSAGES:]
-    return out
+    return out, last_ts
 
 
 def cmd_digest(args) -> int:
     from wake import muted_whys  # lazy: wake.py imports this module at load time
     conn = connect()
-    since = _get_wm(conn)
+    wm = since = _get_wm(conn)
     if args.hours:
         since = max(since, time.time() - args.hours * 3600)
-    msgs = _messages_since(since)
+    msgs, last_ts = _messages_since(since)
     now = time.time()
     active = [
         {
@@ -236,6 +241,10 @@ def cmd_digest(args) -> int:
     payload = {
         "now": _iso(now),
         "watermark": _iso(since),
+        # Raw float, not _iso(): minute rounding would drop or replay messages.
+        # It is the last message *shown here*, so anything arriving between this
+        # digest and the apply is still ahead of the cursor next run.
+        "next_watermark": last_ts if last_ts is not None else wm,
         "new_messages": len(msgs),
         "messages": msgs,
         "followups": active,
@@ -243,7 +252,8 @@ def cmd_digest(args) -> int:
         "mode": "review" if any(f["due"] for f in active) else "capture",
         "night": _is_night(),
         "muted": muted_whys(conn, now),
-        "instructions": "见 prompts/review.md：先更新 followups，再挑 due 的处理，最后私聊 + 开发日志。",
+        "instructions": "见 prompts/review.md：产出一份 apply JSON（watermark 用 next_watermark），"
+                        "需要私聊就先 hermes send，再 followups.py apply 一次写回。",
     }
     print(json.dumps(payload, ensure_ascii=False))
     return 0
@@ -395,6 +405,200 @@ def cmd_close(args) -> int:
     return 0
 
 
+class ApplyError(Exception):
+    """A bad apply document. Raised inside the transaction, so it rolls back."""
+
+
+APPLY_KEYS = ("new_followups", "decisions", "sent", "watermark", "outcomes", "close")
+FOLLOWUP_FIELDS = ("key", "why", "subject", "quote", "revisit_at", "hint", "kind")
+FOLLOWUP_REQUIRED = ("key", "why", "subject", "kind", "revisit_at")  # same as `add`
+ACTIONS = ("silent", "act_report", "ask")
+OUTCOMES = ("accepted", "ignored", "annoyed", "useless", "unknown")
+
+
+def _list(doc: dict, name: str) -> list:
+    v = doc.get(name)
+    if v is None:
+        return []
+    if not isinstance(v, list):
+        raise ApplyError(f"{name}: must be a list")
+    return v
+
+
+def _obj(v, where: str, allowed: tuple) -> dict:
+    if not isinstance(v, dict):
+        raise ApplyError(f"{where}: must be an object")
+    extra = sorted(set(v) - set(allowed))
+    if extra:
+        raise ApplyError(f"{where}: unknown field(s) {extra}")
+    return v
+
+
+def _id(conn, v, where: str) -> int:
+    if not isinstance(v, int) or isinstance(v, bool):
+        raise ApplyError(f"{where}: id must be an integer, got {v!r}")
+    if conn.execute("SELECT 1 FROM followups WHERE id=?", (v,)).fetchone() is None:
+        raise ApplyError(f"{where}: no followup {v}")
+    return v
+
+
+def _when(v, where: str) -> float:
+    if isinstance(v, (int, float)) and not isinstance(v, bool):
+        return float(v)
+    if not isinstance(v, str) or not v.strip():
+        raise ApplyError(f"{where}: required (ISO time, 'now', '+12h', '+2d')")
+    try:
+        return _parse(v.strip())
+    except (ValueError, SystemExit):
+        raise ApplyError(f"{where}: bad time {v!r}") from None
+
+
+def _apply(conn, doc: dict) -> dict:
+    """Every write of one review run. Caller owns BEGIN/COMMIT/ROLLBACK."""
+    now = time.time()
+    res: dict = {"added": [], "outcomes": [], "closed": [], "checked": [], "sent": []}
+
+    for i, f in enumerate(_list(doc, "new_followups")):
+        where = f"new_followups[{i}]"
+        _obj(f, where, FOLLOWUP_FIELDS)
+        for k in FOLLOWUP_REQUIRED:
+            if k == "revisit_at":
+                continue
+            if not isinstance(f.get(k), str) or not f[k].strip():
+                raise ApplyError(f"{where}: missing {k}")
+        # Same upsert as `add`: sent_at / checks / outcome / status survive.
+        row = conn.execute(
+            "INSERT INTO followups(key,kind,why,subject,quote,hint,revisit_at,created_at) "
+            "VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(key) DO UPDATE SET "
+            "why=excluded.why,subject=excluded.subject,quote=excluded.quote,"
+            "hint=excluded.hint,revisit_at=excluded.revisit_at "
+            "RETURNING id",
+            (f["key"].strip(), f["kind"], f["why"], f["subject"], f.get("quote") or "",
+             f.get("hint") or "", _when(f.get("revisit_at"), f"{where}.revisit_at"), now),
+        ).fetchone()
+        res["added"].append(row[0])
+
+    for i, o in enumerate(_list(doc, "outcomes")):
+        where = f"outcomes[{i}]"
+        _obj(o, where, ("id", "value", "close", "note"))
+        fid = _id(conn, o.get("id"), where)
+        if o.get("value") not in OUTCOMES:
+            raise ApplyError(f"{where}: value must be {'|'.join(OUTCOMES)}")
+        conn.execute("UPDATE followups SET outcome=? WHERE id=?", (o["value"], fid))
+        res["outcomes"].append(fid)
+        if o.get("close"):
+            conn.execute("UPDATE followups SET status='closed', note=COALESCE(?,note) WHERE id=?",
+                         (o.get("note"), fid))
+            res["closed"].append(fid)
+
+    for i, c in enumerate(_list(doc, "close")):
+        where = f"close[{i}]"
+        _obj(c, where, ("id", "note"))
+        fid = _id(conn, c.get("id"), where)
+        conn.execute("UPDATE followups SET status='closed', note=COALESCE(?,note) WHERE id=?",
+                     (c.get("note"), fid))
+        res["closed"].append(fid)
+
+    sent = doc.get("sent")
+    sent_ids: list[int] = []
+    if sent is not None:
+        _obj(sent, "sent", ("id", "ids", "msg_id"))
+        if ("id" in sent) == ("ids" in sent):
+            raise ApplyError("sent: give exactly one of id / ids")
+        raw_ids = sent["ids"] if "ids" in sent else [sent["id"]]
+        if not isinstance(raw_ids, list) or not raw_ids:
+            raise ApplyError("sent.ids: must be a non-empty list")
+        sent_ids = [_id(conn, v, "sent") for v in raw_ids]
+        # A send with no message_id is a failure: never record it as delivered.
+        msg_id = str(sent.get("msg_id") or "").strip()
+        if not msg_id:
+            raise ApplyError("sent.msg_id: required — the send failed, do not mark it sent")
+
+    seen: set[int] = set()
+    for i, d in enumerate(_list(doc, "decisions")):
+        where = f"decisions[{i}]"
+        _obj(d, where, ("id", "action", "reason", "snooze"))
+        fid = _id(conn, d.get("id"), where)
+        if fid in seen:
+            raise ApplyError(f"{where}: duplicate decision for followup {fid}")
+        seen.add(fid)
+        action = d.get("action")
+        if action not in ACTIONS:
+            raise ApplyError(f"{where}: action must be {'|'.join(ACTIONS)}, got {action!r}")
+        if d.get("snooze") is not None and action != "silent":
+            raise ApplyError(f"{where}: snooze only applies to action=silent")
+        if action != "silent":
+            continue  # act_report / ask: the send receipt or a later outcome settles it
+        if fid in sent_ids:
+            raise ApplyError(f"{where}: followup {fid} is marked silent but also sent")
+        # Same as `checked`: always move revisit_at forward, or it stays due forever.
+        checks = conn.execute("SELECT checks FROM followups WHERE id=?", (fid,)).fetchone()[0]
+        backoff = min(86400 * (2 ** min(checks or 0, 3)), 7 * 86400)
+        nxt = _when(d["snooze"], f"{where}.snooze") if d.get("snooze") is not None else now + backoff
+        conn.execute("UPDATE followups SET checks=checks+1, last_checked=?, revisit_at=? WHERE id=?",
+                     (now, nxt, fid))
+        res["checked"].append({"id": fid, "next": _iso(nxt)})
+
+    for fid in sent_ids:
+        conn.execute("UPDATE followups SET sent_at=?, sent_msg_id=?, checks=checks+1, "
+                     "revisit_at=? WHERE id=?", (now, msg_id, now + 86400, fid))
+        res["sent"].append(fid)
+    if sent_ids:
+        _set_kv(conn, "last_send", now)
+
+    wm = doc.get("watermark")
+    if not isinstance(wm, (int, float)) or isinstance(wm, bool) or not wm > 0:
+        raise ApplyError("watermark: required, the raw next_watermark float from digest")
+    if wm > now + 60:
+        raise ApplyError(f"watermark: {wm} is in the future; it would skip messages")
+    _set_wm(conn, float(wm))
+    _set_kv(conn, "last_capture", now)
+    res["watermark"] = float(wm)
+
+    res["log_id"] = conn.execute(
+        "INSERT INTO log(run_at,kind,payload) VALUES(?,?,?)",
+        (now, "apply", json.dumps(doc, ensure_ascii=False)),
+    ).lastrowid
+    return res
+
+
+def cmd_apply(args) -> int:
+    """Write back one whole review run — followups, decisions, send receipt,
+    watermark, log — in a single transaction. All or nothing."""
+    def fail(msg: str) -> int:
+        print(json.dumps({"ok": False, "error": msg}, ensure_ascii=False))
+        return 2
+
+    try:
+        if args.file and args.file != "-":
+            raw = Path(args.file).read_text(encoding="utf-8")
+        else:
+            if sys.stdin.isatty():
+                return fail("apply: pass the JSON on stdin or with --file")
+            raw = sys.stdin.read()
+        doc = json.loads(raw)
+    except (OSError, ValueError) as e:
+        return fail(f"apply: cannot read JSON: {e}")
+    if not isinstance(doc, dict):
+        return fail("apply: top level must be a JSON object")
+    extra = sorted(set(doc) - set(APPLY_KEYS))
+    if extra:
+        return fail(f"apply: unknown field(s) {extra}")
+
+    conn = connect()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        res = _apply(conn, doc)
+        conn.execute("COMMIT")
+    except Exception as e:  # noqa: BLE001 - any failure must roll everything back
+        if conn.in_transaction:  # some errors (disk full, ...) already rolled back
+            conn.execute("ROLLBACK")
+        msg = str(e) if isinstance(e, ApplyError) else f"{type(e).__name__}: {e}"
+        return fail(f"apply rolled back, nothing written: {msg}")
+    print(json.dumps({"ok": True, **res}, ensure_ascii=False))
+    return 0
+
+
 def cmd_watermark(args) -> int:
     conn = connect()
     if args.set:
@@ -465,6 +669,10 @@ def main() -> int:
     cl.add_argument("id", type=int)
     cl.add_argument("--note", default="")
     cl.set_defaults(fn=cmd_close)
+
+    ap_ = sub.add_parser("apply")
+    ap_.add_argument("--file", default="", help="apply JSON (default: stdin)")
+    ap_.set_defaults(fn=cmd_apply)
 
     w = sub.add_parser("watermark")
     w.add_argument("--set", default="")

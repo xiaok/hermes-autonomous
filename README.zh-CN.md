@@ -14,18 +14,17 @@
 
 ## 安装（约两分钟，不用写代码）
 
-在 Hermes 里直接说：
-
-> 帮我装插件 `xiaok/hermes-autonomous` 并启用，配好我的 Telegram id（就是你正在对话的这个），然后建好复盘的定时任务。
-
-它会自己完成安装、写本地配置、建 cron。仓库里不存任何身份信息，全部落在你自己的 `~/.hermes`。
-
-### 或者四条命令
+它就是一个普通 Hermes 插件，安装只要一行：
 
 ```bash
 hermes plugins install xiaok/hermes-autonomous --enable
+```
+
+再把下面四行填好，把它接到你的聊天并挂上定时任务：
+
+```bash
 PLUGIN=~/.hermes/plugins/hermes-autonomous
-python3 $PLUGIN/scripts/followups.py setup --owner-id <你的 Telegram user id> --dm-target telegram:<chat_id> --timezone Asia/Shanghai
+python3 $PLUGIN/scripts/followups.py setup --owner-id <你的 Telegram user id> --dm-target telegram:<chat_id>
 cp $PLUGIN/cron/*.py ~/.hermes/scripts/
 hermes cron create "*/15 * * * *" --name "主动跟进" \
   --monitor-script followup-wake.py --script followup-digest.py \
@@ -34,7 +33,9 @@ hermes cron create "*/15 * * * *" --name "主动跟进" \
 
 不知道自己的 id？找 [@userinfobot](https://t.me/userinfobot)，或者直接问 Hermes——它知道当前会话的 id。
 
-`--timezone` 填 IANA 名称（`Asia/Tokyo`、`Europe/Berlin`…），不填就用机器本地时区。代码里没有任何硬编码时区——**提醒早了一小时，永远先查时区设置，不是调度 bug**。
+也可以直接跟你的 agent 说：
+
+> 帮我装插件 `xiaok/hermes-autonomous` 并启用，配好当前这个会话，然后建好复盘的定时任务。
 
 ### 从源码安装（开发用）
 

@@ -18,20 +18,17 @@ It is not a digest. It is not a task list. It does not require you to configure 
 
 ## Install (about 2 minutes, no coding)
 
-Inside Hermes, just say:
-
-> Install the plugin `xiaok/hermes-autonomous`, enable it, and configure it for me — my Telegram user
-> id is the one you are talking to right now. Then create the review cron job.
-
-The agent installs, writes your local settings, and schedules the job. Nothing identifying is stored
-in this repo; it all lives in your own `~/.hermes`.
-
-### Or four commands
+It is an ordinary Hermes plugin, so the install is one command:
 
 ```bash
 hermes plugins install xiaok/hermes-autonomous --enable
+```
+
+Then four more lines wire it to your chat and schedule the loop:
+
+```bash
 PLUGIN=~/.hermes/plugins/hermes-autonomous
-python3 $PLUGIN/scripts/followups.py setup --owner-id <id> --dm-target telegram:<id> --timezone Asia/Shanghai
+python3 $PLUGIN/scripts/followups.py setup --owner-id <id> --dm-target telegram:<id>
 cp $PLUGIN/cron/*.py ~/.hermes/scripts/
 hermes cron create "*/15 * * * *" --name "proactive follow-ups" \
   --monitor-script followup-wake.py --script followup-digest.py \
@@ -41,9 +38,10 @@ hermes cron create "*/15 * * * *" --name "proactive follow-ups" \
 Don't know your Telegram id? Message [@userinfobot](https://t.me/userinfobot), or ask Hermes — it can
 read the id of the conversation it is in.
 
-`--timezone` takes an IANA name (`Asia/Tokyo`, `Europe/Berlin`, …). Leave it out and the machine's own
-timezone is used. Nothing is hardcoded — reminders firing an hour early is always a timezone setting,
-not a schedule bug.
+Or simply tell your agent:
+
+> Install the plugin `xiaok/hermes-autonomous`, enable it, configure it for the chat we are in, and
+> create the review cron job.
 
 ### From source (development)
 

@@ -70,6 +70,32 @@ def set_kv(conn, k: str, v: float) -> None:
                  (k, str(v)))
 
 
+MUTE_WINDOW_S = 30 * 86400
+MUTE_IGNORED_AFTER = 3
+
+
+def muted_whys(conn, now: float | None = None) -> dict[str, str]:
+    """Categories (``why``) the owner has pushed back on in the last 30 days.
+
+    One ``annoyed`` or three ``ignored`` on sent followups mutes that category:
+    its items stay in the table but no longer wake the agent into review.
+    """
+    now = time.time() if now is None else now
+    rows = conn.execute(
+        "SELECT why, outcome, COUNT(*) AS n FROM followups "
+        "WHERE sent_at IS NOT NULL AND sent_at>=? AND why IS NOT NULL "
+        "AND outcome IN ('annoyed','ignored') GROUP BY why, outcome",
+        (now - MUTE_WINDOW_S,),
+    ).fetchall()
+    muted: dict[str, str] = {}
+    for r in rows:
+        if r["outcome"] == "annoyed":
+            muted[r["why"]] = "annoyed"
+        elif r["n"] >= MUTE_IGNORED_AFTER:
+            muted.setdefault(r["why"], f"ignored*{r['n']}")
+    return muted
+
+
 def owner_id() -> str:
     """Owner id comes from settings.json / env, never from the repo."""
     val = os.environ.get("AUTONOMY_OWNER_ID", "")
@@ -127,13 +153,14 @@ def main() -> int:
         if n >= MIN_NEW_MSGS or (n > 0 and now - last_capture > 8 * 3600):
             feedback.append("capture")
 
-    # 2) due followups
+    # 2) due followups, minus categories the owner has muted by feedback
+    muted = muted_whys(conn, now)
     due = conn.execute(
-        "SELECT id FROM followups WHERE status='active' AND COALESCE(revisit_at,0)<=? "
+        "SELECT id, why FROM followups WHERE status='active' AND COALESCE(revisit_at,0)<=? "
         "AND (sent_at IS NULL OR sent_at < revisit_at) "
-        "ORDER BY revisit_at LIMIT 10", (now,)
+        "ORDER BY revisit_at", (now,)
     ).fetchall()
-    due_ids = [r["id"] for r in due]
+    due_ids = [r["id"] for r in due if r["why"] not in muted][:10]
     if due_ids:
         last_send = get_kv(conn, "last_send", 0.0)
         cooling = (now - last_send) < SEND_COOLDOWN_S

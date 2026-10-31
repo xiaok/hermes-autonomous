@@ -213,6 +213,7 @@ def _messages_since(since: float) -> list[dict]:
 
 
 def cmd_digest(args) -> int:
+    from wake import muted_whys  # lazy: wake.py imports this module at load time
     conn = connect()
     since = _get_wm(conn)
     if args.hours:
@@ -241,6 +242,7 @@ def cmd_digest(args) -> int:
         "due_count": sum(1 for f in active if f["due"]),
         "mode": "review" if any(f["due"] for f in active) else "capture",
         "night": _is_night(),
+        "muted": muted_whys(conn, now),
         "instructions": "见 prompts/review.md：先更新 followups，再挑 due 的处理，最后私聊 + 开发日志。",
     }
     print(json.dumps(payload, ensure_ascii=False))

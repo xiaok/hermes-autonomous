@@ -70,9 +70,11 @@ watermark(surface, last_ts)
 log(id, run_at, kind, payload)
 ```
 
-## 与已有 v0.1 队列的关系
+## 不做的事
 
-队列（`autonomy_enqueue` + tick）留着当“手”：复盘决定要做但耗时的事（生成 PDF、跑一次长检查），丢进队列由 tick 执行，完成后再汇报。主体是 followups，队列只是执行器。
+v0.1 的那套任务队列（`autonomy_*` 工具 + 无人值守 tick）已经删掉：它会 spawn 一个全工具的
+headless 会话来执行没人当场批准的任务，既用不上，也过不了插件目录的审批规则（rule 12）。
+现在插件只有 `scripts/` 里几个本地脚本 + 一个 `/followups` 命令，没有任何后台执行器。
 
 ## 已知风险
 

@@ -94,6 +94,15 @@ python3 ~/opt/hermes-autonomous/scripts/followups.py setup --owner-id … --dm-t
 - 状态存在 `~/.hermes/plugin-data/hermes-autonomous/`（SQLite + 配置，权限 0600），不进仓库。
 - 仓库里**没有**任何 id、名字、聊天记录或个人场景——都在本地配置。
 
+## 它碰了什么（披露）
+
+- **读**：Hermes 的会话库 `~/.hermes/state.db`，只读，且只读**你自己**在私聊和本人话题里发的消息；不读其他文件。
+- **写**：只有自己的数据目录 `~/.hermes/plugin-data/hermes-autonomous/`（SQLite 跟进表 + `settings.json`，权限 0600）。
+- **网络**：插件代码本身不发任何请求。复盘时 agent 可能用 Hermes 自带工具查天气/价格/新闻——那是 Hermes 的流量，不是这个插件的。
+- **Shell**：`/followups` 只用 `sys.executable` 跑一个本地 Python 脚本；cron 那侧也是纯 Python。不 spawn `hermes`、不注册 hook、没有后台线程、不绕过审批。
+- **凭据**：没有。Telegram id 存在插件自己的 `settings.json`（0600），不读 `.env`、`auth.json` 或钥匙串。
+- 无遥测、无统计上报。
+
 ## 文档
 
 [English](README.md) · [设计](docs/DESIGN.md) · [调研](docs/RESEARCH.md) · [判断规范](docs/DECIDER.md)

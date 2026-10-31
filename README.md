@@ -115,6 +115,21 @@ The full teardown and the research numbers (the best models score ~66% F1 on "sh
   the repo.
 - The repo ships with **no** ids, names, chats or personal scenarios — you configure them locally.
 
+## What it touches (disclosure)
+
+- **Reads** the Hermes session database `~/.hermes/state.db` — read-only, and only messages *you*
+  wrote in your own DM and group topics. No other files are read.
+- **Writes** only its own data directory `~/.hermes/plugin-data/hermes-autonomous/`
+  (SQLite board + `settings.json`, mode 0600).
+- **Network**: the plugin code makes no requests. During a review your agent may look things up
+  (weather, prices, news) using Hermes' own tools — that traffic belongs to Hermes, not to this plugin.
+- **Shell**: `/followups` runs one local Python helper (`scripts/followups.py`) with
+  `sys.executable`; the cron helpers are plain Python. No `hermes` subprocess is spawned, no hook,
+  no background thread, no approval bypass.
+- **Credentials**: none. Your Telegram ids live in the plugin's own `settings.json` (0600) — not in
+  `.env`, `auth.json` or any keychain.
+- No telemetry, no analytics.
+
 ## Docs
 
 [中文说明](README.zh-CN.md) · [Design](docs/DESIGN.md) · [Research](docs/RESEARCH.md) ·

@@ -4,7 +4,7 @@
 Deterministic gates (night / cooldown / due / caps) live here in code; the
 judgement itself is one LLM call with no tools. This is the same rubric the
 cron review uses, extracted so scenarios can be evaluated without touching the
-live queue.
+live board.
 
     python3 scripts/decide.py --scenario scenarios/example.json
     python3 scripts/decide.py --scenario s.json --json     # raw result only

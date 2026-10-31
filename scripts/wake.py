@@ -54,7 +54,7 @@ def home() -> Path:
 # Schema lives in followups.py only; sharing its connect() keeps every table in
 # place no matter which entry point touches the DB first.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from followups import chat_types, connect, muted_whys  # noqa: E402
+from followups import NOISE, chat_types, connect, muted_whys  # noqa: E402
 
 
 def get_kv(conn, k: str, default: float = 0.0) -> float:
@@ -97,8 +97,11 @@ def count_new_human(conn, since: float) -> int:
             "SELECT COUNT(*) FROM messages m JOIN sessions s ON s.id=m.session_id "
             f"WHERE m.timestamp>? AND m.role='user' AND s.chat_type IN ({','.join('?' * len(types))}) "
             "AND s.user_id=? AND m.content NOT LIKE '[Cron delivery:%' "
-            "AND m.content NOT LIKE '[INTERNAL%' AND m.content NOT LIKE '[ASYNC%'",
-            (since, *types, owner),
+            "AND m.content NOT LIKE '[INTERNAL%' AND m.content NOT LIKE '[ASYNC%' "
+            # Whatever digest drops as noise must not count here either, or it wakes
+            # a capture that digests nothing and never moves the cursor past it.
+            + "AND ltrim(m.content) NOT LIKE ? " * len(NOISE),
+            (since, *types, owner, *(n + "%" for n in NOISE)),
         ).fetchone()[0]
     finally:
         c.close()

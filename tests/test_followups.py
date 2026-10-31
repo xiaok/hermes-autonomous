@@ -37,6 +37,22 @@ def daytime_tz() -> str:
     raise RuntimeError("no daytime zone found")
 
 
+def tz_at_hour(hour: int) -> str:
+    """A fixed-offset zone whose local hour is ``hour`` right now. Etc/GMT-14..+12
+    covers all 24 hours, so this never depends on when the test runs."""
+    from zoneinfo import ZoneInfo
+    for off in range(-12, 15):
+        name = f"Etc/GMT{-off:+d}"
+        if datetime.now(ZoneInfo(name)).hour == hour:
+            return name
+    raise RuntimeError(f"no zone at hour {hour}")
+
+
+def local_hour(tz: str) -> int:
+    from zoneinfo import ZoneInfo
+    return datetime.now(ZoneInfo(tz)).hour
+
+
 class Home(unittest.TestCase):
     def setUp(self):
         self.home = Path(tempfile.mkdtemp(prefix="hermes-home-"))
@@ -524,6 +540,205 @@ class ReadOnlyCommands(Home):
         with mock.patch.dict(os.environ, self.env, clear=True):  # the subprocess inherits it
             self.assertIn("还没有复盘记录", plugin._followups_command("log"))
             self.assertIn("静默中的类别", plugin._followups_command("why"))
+
+
+class WakeHold(Home):
+    """Due items must never become a review at night or inside the send cooldown:
+    the gate says capture (if there is something to capture) or quiet."""
+
+    def setUp(self):
+        super().setUp()
+        self.setup_owner()
+        self.now = time.time()
+        self.due = self.add("due-item", why="utility")
+
+    def at_hour(self, hour: int) -> str:
+        """Point the configured zone at a fixed offset where it is ``hour`` now and
+        wake. Returns None if the hour rolled over mid-call (only at :59:59)."""
+        tz = tz_at_hour(hour)
+        self.fu("setup", "--timezone", tz)
+        out = self.wake()
+        return out if local_hour(tz) == hour else None
+
+    def arm_capture(self):
+        c = self.db()
+        c.execute("INSERT INTO kv(k,v) VALUES('last_capture',?)", (str(self.now - 3 * 3600),))
+        c.commit()
+        self.state_db([(self.now - 30, "user", "new message", OWNER)])
+
+    def set_last_send(self, ago_s: float):
+        c = self.db()
+        c.execute("INSERT INTO kv(k,v) VALUES('last_send',?) "
+                  "ON CONFLICT(k) DO UPDATE SET v=excluded.v", (str(self.now - ago_s),))
+        c.commit()
+
+    def test_night_hours_hold_review(self):
+        for hour in (23, 0, 3, 7):
+            with self.subTest(hour=hour):
+                out = self.at_hour(hour)
+                if out is not None:
+                    self.assertEqual(out, "quiet")
+
+    def test_night_with_capture_wakes_capture_only(self):
+        self.arm_capture()
+        for hour in (23, 3, 7):
+            with self.subTest(hour=hour):
+                out = self.at_hour(hour)
+                if out is not None:
+                    self.assertEqual(json.loads(out), {"mode": "capture", "night": True})
+
+    def test_day_edges_do_review(self):
+        # Control: the same state at 08:xx and 22:xx is a review, so the holds above
+        # come from the night rule and not from something else.
+        for hour in (8, 22):
+            with self.subTest(hour=hour):
+                out = self.at_hour(hour)
+                if out is not None:
+                    self.assertEqual(json.loads(out),
+                                     {"mode": "review", "ids": [self.due], "night": False})
+
+    def test_cooldown_holds_review(self):
+        self.set_last_send(30 * 60)
+        self.assertEqual(self.wake(), "quiet")
+        self.set_last_send(89 * 60)
+        self.assertEqual(self.wake(), "quiet")
+
+    def test_cooldown_with_capture_wakes_capture_only(self):
+        self.set_last_send(30 * 60)
+        self.arm_capture()
+        self.assertEqual(json.loads(self.wake()), {"mode": "capture", "night": False})
+
+    def test_cooldown_over_reviews(self):
+        self.set_last_send(91 * 60)
+        self.assertEqual(json.loads(self.wake())["mode"], "review")
+
+
+class PromptContract(Home):
+    """prompts/review.md tells the agent what to feed `apply`. If the examples there
+    drift from what apply accepts, the agent is taught to write rejected documents."""
+
+    PROMPT = ROOT / "prompts" / "review.md"
+
+    def setUp(self):
+        super().setUp()
+        self.setup_owner()
+        self.text = self.PROMPT.read_text(encoding="utf-8")
+        # The examples use ids up to 15 (§4 "ids": [12, 15]); make all of them real.
+        for i in range(1, 16):
+            self.assertEqual(self.add(f"existing-{i}"), i)
+
+    def example_doc(self) -> dict:
+        """The heredoc in §5: python3 ... apply <<'JSON' ... JSON."""
+        import re
+        m = re.search(r"followups\.py\" apply <<'JSON'\n(.*?)\nJSON\n", self.text, re.S)
+        self.assertIsNotNone(m, "apply heredoc example not found in prompts/review.md")
+        return json.loads(m.group(1))
+
+    def inline_snippets(self, prefix: str) -> list[str]:
+        """Backticked inline examples starting with ``prefix``, e.g. `"sent": {...}`."""
+        import re
+        return re.findall(r"`(" + re.escape(prefix) + r"[^`]*)`", self.text)
+
+    def test_heredoc_example_applies(self):
+        doc = self.example_doc()
+        # Guard the extraction itself: it must be the full example, not a fragment.
+        self.assertTrue({"new_followups", "decisions", "sent", "watermark"} <= set(doc), doc)
+        out = self.apply(doc)
+        self.assertTrue(out["ok"], out)
+        c = self.db()
+        self.assertIsNotNone(c.execute(
+            "SELECT 1 FROM followups WHERE key=?", (doc["new_followups"][0]["key"],)).fetchone())
+        self.assertEqual(self.row(doc["sent"]["id"])["sent_msg_id"], doc["sent"]["msg_id"])
+        got = c.execute("SELECT last_ts FROM watermark WHERE surface='messages'").fetchone()[0]
+        self.assertEqual(got, doc["watermark"])
+
+    def test_sent_variants_apply(self):
+        # §4: single id and several ids in one message (msg_id "<mid>" is a shell
+        # placeholder but a valid non-empty string).
+        snippets = self.inline_snippets('"sent": {')
+        self.assertGreaterEqual(len(snippets), 2, snippets)
+        for s in snippets:
+            with self.subTest(s=s):
+                doc = json.loads("{" + s + ', "watermark": 1.0}')
+                self.assertTrue(self.apply(doc)["ok"])
+
+    def test_outcome_variants_apply(self):
+        # §5: one example per outcome value.
+        snippets = self.inline_snippets('{"id": ')
+        outcomes = [json.loads(s) for s in snippets if '"value"' in s]
+        self.assertGreaterEqual(len(outcomes), 4, snippets)
+        for o in outcomes:
+            with self.subTest(o=o):
+                self.assertTrue(self.apply({"outcomes": [o], "watermark": 1.0})["ok"])
+
+    def test_empty_parts_as_documented(self):
+        # §5: "没有的部分给空列表或 null；watermark 必须有。"
+        doc = {"new_followups": [], "outcomes": None, "close": [], "decisions": [],
+               "sent": None, "watermark": 1.0}
+        self.assertTrue(self.apply(doc)["ok"])
+
+
+class DigestTruncationAndNoise(Home):
+    def setUp(self):
+        super().setUp()
+        self.setup_owner()
+        self.wm = time.time() - 3600
+        self.apply({"watermark": self.wm})
+
+    def digest(self) -> dict:
+        return json.loads(self.fu("digest").stdout)
+
+    def test_keeps_tail_250_and_cursor_is_last_kept(self):
+        n = 300
+        self.state_db([(self.wm + 1 + i * 0.5, "user" if i % 2 else "assistant", f"m{i}", OWNER)
+                       for i in range(n)])
+        d = self.digest()
+        texts = [m["text"] for m in d["messages"]]
+        self.assertEqual(len(texts), 250)
+        self.assertEqual(texts, [f"m{i}" for i in range(n - 250, n)])
+        self.assertEqual(d["new_messages"], 250)
+        self.assertEqual(d["next_watermark"], self.wm + 1 + (n - 1) * 0.5)
+
+    def test_trailing_noise_does_not_move_cursor(self):
+        n = 260
+        msgs = [(self.wm + 1 + i, "user", f"m{i}", OWNER) for i in range(n)]
+        msgs.append((self.wm + 1000, "user", "[CONTEXT COMPACTION] summary", OWNER))
+        self.state_db(msgs)
+        d = self.digest()
+        self.assertEqual([m["text"] for m in d["messages"]], [f"m{i}" for i in range(10, n)])
+        self.assertEqual(d["next_watermark"], self.wm + n)  # last kept, not the noise
+
+    def test_compaction_messages_are_dropped(self):
+        self.state_db([
+            (self.wm + 1, "user", "real one", OWNER),
+            (self.wm + 2, "assistant", "[CONTEXT COMPACTION] earlier turns summarised", OWNER),
+            (self.wm + 3, "user", "  [CONTEXT COMPACTION — leading space", OWNER),
+            (self.wm + 4, "assistant", "real two", OWNER),
+        ])
+        d = self.digest()
+        self.assertEqual([m["text"] for m in d["messages"]], ["real one", "real two"])
+        self.assertFalse(any("CONTEXT COMPACTION" in m["text"] for m in d["messages"]))
+
+    def test_noise_does_not_count_toward_the_cap(self):
+        msgs = []
+        for i in range(260):
+            text = f"[CONTEXT COMPACTION {i}]" if i % 13 == 0 else f"m{i}"
+            msgs.append((self.wm + 1 + i, "user", text, OWNER))
+        self.state_db(msgs)
+        texts = [m["text"] for m in self.digest()["messages"]]
+        self.assertEqual(len(texts), 240)  # 20 noise dropped first, so nothing truncated
+        self.assertEqual(texts[0], "m1")
+
+    def test_wake_ignores_compaction_only_traffic(self):
+        # Wake and digest must agree on what counts as a new message: otherwise a
+        # lone compaction turn wakes a capture every 2h that digests nothing and
+        # never moves the cursor past it.
+        c = self.db()
+        c.execute("UPDATE kv SET v=? WHERE k='last_capture'", (str(time.time() - 3 * 3600),))
+        c.commit()
+        self.state_db([(self.wm + 5, "user", "[CONTEXT COMPACTION] summary", OWNER)])
+        self.assertEqual(self.digest()["messages"], [])
+        self.assertEqual(self.wake(), "quiet")
 
 
 if __name__ == "__main__":

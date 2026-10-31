@@ -51,7 +51,9 @@
 
 ## 运行形态
 
-- **复盘**：每天 09:00、19:00（一个 cron job，`0 9,19 * * *`）
+- **复盘**：事件驱动。一个 Hermes cron job 每 15 分钟（`*/15 * * * *`）先跑门卫 `scripts/wake.py`
+  （不调模型）：没事就输出常量 `quiet`，输出与上次相同时 cron 的 monitor 直接跳过 agent；
+  有到期跟进点（且不在 90 分钟冷却 / 夜间）→ review，距上次 capture ≥2 小时且有新消息 → capture
 - **输入**：`scripts/followups.py digest`（自上次水位的消息 + 现行跟进点）
 - **提示词**：`prompts/review.md`
 - **产品输出**：`hermes send --to "$(followups.py dm-target)"`（私聊，≤1 条/次，≤3 项）
@@ -74,11 +76,12 @@ log(id, run_at, kind, payload)
 
 v0.1 的那套任务队列（`autonomy_*` 工具 + 无人值守 tick）已经删掉：它会 spawn 一个全工具的
 headless 会话来执行没人当场批准的任务，既用不上，也过不了插件目录的审批规则（rule 12）。
-现在插件只有 `scripts/` 里几个本地脚本 + 一个 `/followups` 命令，没有任何后台执行器。
+现在插件只有 `scripts/` 里几个本地脚本 + 一个 `/followups` 命令，自己不注册任何后台执行器；
+唯一的定时运行是用户自己用 `hermes cron create` 建的那个 job（`hermes cron list` 里看得到、可删）。
 
 ## 已知风险
 
 1. **误报**：ProactiveBench 最好的模型 precision 只有 35–48%，所以“不及格就不发”必须严格执行，且要有日志能回头看。
 2. **重复**：同一件事不能每天提，`checks` 计数 + `revisit_at` 后移。
-3. **隐私**：复盘会读全部对话，数据不出本机。
+3. **隐私**：复盘读主人会话里的全部用户/助手消息（默认只有私聊，`include_groups` 才读群），数据不出本机。
 4. **过度解读**：没有原话依据的一律降级为问句。

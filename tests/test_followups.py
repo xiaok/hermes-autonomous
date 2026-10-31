@@ -98,18 +98,19 @@ class Home(unittest.TestCase):
                 for t in ("followups", "watermark", "kv", "log")}
 
     def state_db(self, messages: list[tuple]) -> None:
-        """messages: (timestamp, role, content, user_id)."""
+        """messages: (timestamp, role, content, user_id[, chat_type='dm'])."""
+        messages = [m if len(m) == 5 else (*m, "dm") for m in messages]
         c = sqlite3.connect(self.home / "state.db")
         c.executescript(
             "CREATE TABLE sessions (id TEXT PRIMARY KEY, source TEXT, chat_type TEXT,"
             " title TEXT, user_id TEXT);"
             "CREATE TABLE messages (id INTEGER PRIMARY KEY, session_id TEXT,"
             " timestamp REAL, role TEXT, content TEXT);")
-        for uid in {m[3] for m in messages}:
+        for uid, ct in {(m[3], m[4]) for m in messages}:
             c.execute("INSERT INTO sessions VALUES(?,?,?,?,?)",
-                      (f"s-{uid}", "telegram", "dm", "t", uid))
+                      (f"s-{uid}-{ct}", "telegram", ct, "t", uid))
         c.executemany("INSERT INTO messages(session_id,timestamp,role,content) VALUES(?,?,?,?)",
-                      [(f"s-{m[3]}", m[0], m[1], m[2]) for m in messages])
+                      [(f"s-{m[3]}-{m[4]}", m[0], m[1], m[2]) for m in messages])
         c.commit()
         c.close()
 
@@ -380,6 +381,123 @@ class WakeMuted(Home):
         self.add("care-due", "care")
         self.past("care", "annoyed")
         self.assertEqual(self.wake(), "quiet")
+
+
+class IncludeGroups(Home):
+    def setUp(self):
+        super().setUp()
+        self.setup_owner()
+        self.wm = time.time() - 3600
+        self.apply({"watermark": self.wm})
+        self.state_db([
+            (self.wm + 1, "user", "in my dm", OWNER, "dm"),
+            (self.wm + 2, "user", "a group member said this", OWNER, "group"),
+        ])
+
+    def texts(self) -> list[str]:
+        return [m["text"] for m in json.loads(self.fu("digest").stdout)["messages"]]
+
+    def test_default_reads_dm_only(self):
+        settings = json.loads((self.home / "plugin-data" / "hermes-autonomous"
+                               / "settings.json").read_text())
+        self.assertIs(settings["include_groups"], False)
+        self.assertEqual(self.texts(), ["in my dm"])
+
+    def test_setup_include_groups_reads_groups(self):
+        self.fu("setup", "--include-groups")
+        self.assertEqual(self.texts(), ["in my dm", "a group member said this"])
+        self.fu("setup", "--no-include-groups")
+        self.assertEqual(self.texts(), ["in my dm"])
+
+    def test_wake_counts_only_what_digest_reads(self):
+        c = self.db()
+        c.execute("UPDATE kv SET v=? WHERE k='last_capture'", (str(time.time() - 3 * 3600),))
+        c.commit()
+        sc = sqlite3.connect(self.home / "state.db")
+        sc.execute("DELETE FROM messages WHERE content='in my dm'")
+        sc.commit()
+        sc.close()
+        self.assertEqual(self.wake(), "quiet")  # only a group message: not read by default
+        self.fu("setup", "--include-groups")
+        self.assertEqual(json.loads(self.wake())["mode"], "capture")
+
+
+class CaptureCadence(Home):
+    """Cadence follows kv.last_capture; the watermark is only the message cursor."""
+
+    def setUp(self):
+        super().setUp()
+        self.setup_owner()
+        self.now = time.time()
+
+    def state(self, watermark: float, last_capture: float | None):
+        c = self.db()
+        c.execute("INSERT INTO watermark(surface,last_ts) VALUES('messages',?)", (watermark,))
+        if last_capture is not None:
+            c.execute("INSERT INTO kv(k,v) VALUES('last_capture',?)", (str(last_capture),))
+        c.commit()
+        self.state_db([(self.now - 30, "user", "new message", OWNER)])
+
+    def test_fresh_watermark_old_capture_wakes(self):
+        self.state(watermark=self.now - 60, last_capture=self.now - 3 * 3600)
+        self.assertEqual(json.loads(self.wake())["mode"], "capture")
+
+    def test_old_watermark_recent_capture_stays_quiet(self):
+        self.state(watermark=self.now - 5 * 3600, last_capture=self.now - 60)
+        self.assertEqual(self.wake(), "quiet")
+
+    def test_old_db_without_last_capture_falls_back_to_watermark(self):
+        self.state(watermark=self.now - 3 * 3600, last_capture=None)
+        self.assertEqual(json.loads(self.wake())["mode"], "capture")
+
+    def test_apply_does_not_rearm_capture(self):
+        # apply moves the watermark to the last message but stamps last_capture = now.
+        self.state_db([(self.now - 30, "user", "new message", OWNER)])
+        self.apply({"watermark": self.now - 3 * 3600})
+        self.assertEqual(self.wake(), "quiet")
+
+
+class ReadOnlyCommands(Home):
+    def setUp(self):
+        super().setUp()
+        self.setup_owner()
+
+    def test_why_and_log_empty_state(self):
+        before = self.snapshot()
+        why = self.fu("why").stdout
+        self.assertIn("（无）", why)
+        self.assertIn("还没有复盘记录", why)
+        self.assertIn("还没有复盘记录", self.fu("log").stdout)
+        self.assertEqual(self.snapshot(), before)
+
+    def test_why_and_log_with_data(self):
+        a, b = self.add("a", why="care"), self.add("b", why="utility")
+        self.apply({"decisions": [{"id": a, "action": "silent", "reason": "no news"},
+                                  {"id": b, "action": "act_report", "reason": "rain"}],
+                    "sent": {"id": b, "msg_id": "1"},
+                    "outcomes": [{"id": b, "value": "annoyed"}], "watermark": 1.0})
+        self.apply({"watermark": 1.0})
+        before = self.snapshot()
+        why = self.fu("why").stdout
+        self.assertIn("utility: annoyed", why)
+        self.assertIn(f"#{a} silent  no news", why)
+        self.assertIn(f"#{b} act_report  rain", why)
+        log = self.fu("log").stdout.splitlines()
+        self.assertEqual(len(log), 2)
+        self.assertIn("mode=capture  sent=0  decisions=0", log[0])  # newest first
+        self.assertIn("mode=review   sent=1  decisions=2", log[1])
+        self.assertNotIn("{", "".join(log))
+        self.assertEqual(self.snapshot(), before)
+
+    def test_chat_command_routes_why_and_log(self):
+        import importlib.util
+        from unittest import mock
+        spec = importlib.util.spec_from_file_location("hermes_autonomous_plugin", ROOT / "__init__.py")
+        plugin = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(plugin)
+        with mock.patch.dict(os.environ, self.env, clear=True):  # the subprocess inherits it
+            self.assertIn("还没有复盘记录", plugin._followups_command("log"))
+            self.assertIn("静默中的类别", plugin._followups_command("why"))
 
 
 if __name__ == "__main__":

@@ -16,6 +16,8 @@ checked ID [--snooze ISO]  mark "already looked at it"; optional next revisit
 close ID [--note S]    retire it for good
 watermark [--set ISO]  read or set the message cursor
 apply [--file F]       write back a whole review run (JSON, stdin by default) in one transaction
+why                    muted categories + decisions of the last 5 runs (read-only)
+log                    one line per recent review run (read-only)
 """
 
 from __future__ import annotations
@@ -49,7 +51,7 @@ MAX_MSG_CHARS = 1200
 MAX_MESSAGES = 250
 
 # Who owns this install lives in settings.json (or AUTONOMY_OWNER_ID), never in
-# the repo: only messages the owner himself sent are trusted input.
+# the repo: only the owner's own sessions are read (DM only unless include_groups).
 SETTINGS_KEYS = ("owner_id", "dm_target")
 
 
@@ -83,6 +85,12 @@ def _is_night() -> bool:
 
 def owner_id() -> str:
     return setting("owner_id", "AUTONOMY_OWNER_ID")
+
+
+def chat_types() -> tuple[str, ...]:
+    """DM sessions only, unless setup --include-groups: in a group, other members'
+    messages land in the owner's session too, so reading groups is opt-in."""
+    return ("dm", "group") if (load_settings() or {}).get("include_groups") is True else ("dm",)
 
 
 def dm_target() -> str:
@@ -174,26 +182,28 @@ def _set_wm(conn, ts: float) -> None:
 
 
 def _messages_since(since: float) -> tuple[list[dict], float | None]:
-    """Owner messages after ``since``, plus the raw timestamp of the last one
-    returned (None if none) — the exact cursor the next apply should store."""
+    """User and assistant turns after ``since`` in the owner's sessions, plus the
+    raw timestamp of the last one returned (None if none) — the exact cursor the
+    next apply should store."""
     state = Path(os.environ.get("HERMES_HOME") or (Path.home() / ".hermes")) / "state.db"
     if not state.exists():
         return [], None
+    types = chat_types()
     c = sqlite3.connect(f"file:{state}?mode=ro", uri=True, timeout=30)
     c.row_factory = sqlite3.Row
     rows = c.execute(
-        """
+        f"""
         SELECT m.timestamp, m.role, m.content, s.source, s.chat_type, s.title
         FROM messages m JOIN sessions s ON s.id = m.session_id
         WHERE m.timestamp > ? AND m.role IN ('user','assistant')
           AND m.content IS NOT NULL AND length(trim(m.content)) > 0
-          -- Only messages the owner himself typed, in his DM or his own group
-          -- topics. Anyone else's text is untrusted input for a shell-capable agent.
-          AND s.chat_type IN ('dm','group') AND s.user_id = ?
+          -- Sessions owned by the owner, DM only by default. A group session's
+          -- 'user' turns can be other members: only read them with include_groups.
+          AND s.chat_type IN ({','.join('?' * len(types))}) AND s.user_id = ?
           AND m.content NOT LIKE '[Cron delivery:%'
         ORDER BY m.timestamp ASC
         """,
-        (since, owner_id()),
+        (since, *types, owner_id()),
     ).fetchall()
     out = []
     last_ts = None
@@ -332,6 +342,9 @@ def cmd_setup(args) -> int:
         cur["dm_target"] = str(args.dm_target)
     if args.timezone:
         cur["timezone"] = str(args.timezone)
+    if args.include_groups is not None:
+        cur["include_groups"] = args.include_groups
+    cur.setdefault("include_groups", False)
     settings_path().write_text(json.dumps(cur, indent=2), encoding="utf-8")
     saved = settings_path()
     os.chmod(saved, 0o600)
@@ -609,6 +622,63 @@ def cmd_watermark(args) -> int:
     return 0
 
 
+def _recent_runs(conn, n: int) -> list[tuple[float, dict]]:
+    """Newest-first (run_at, apply doc). A payload that is not a JSON object reads as {}."""
+    out = []
+    for r in conn.execute("SELECT run_at, payload FROM log ORDER BY id DESC LIMIT ?", (n,)):
+        try:
+            doc = json.loads(r["payload"] or "")
+        except ValueError:
+            doc = None
+        out.append((r["run_at"], doc if isinstance(doc, dict) else {}))
+    return out
+
+
+def _sent_ids(doc: dict) -> list:
+    s = doc.get("sent")
+    if not isinstance(s, dict):
+        return []
+    ids = s.get("ids") if "ids" in s else [s.get("id")]
+    return ids if isinstance(ids, list) else []
+
+
+def cmd_why(_args) -> int:
+    from wake import MUTE_IGNORED_AFTER, muted_whys  # lazy: wake.py imports this module
+    conn = connect()
+    muted = muted_whys(conn)
+    print(f"静默中的类别（近 30 天：annoyed 1 次 / ignored {MUTE_IGNORED_AFTER} 次即静默）：")
+    for why, reason in sorted(muted.items()):
+        print(f"  {why}: {reason}")
+    if not muted:
+        print("  （无）")
+    runs = _recent_runs(conn, 5)
+    print("最近 5 次复盘的决策：")
+    for run_at, doc in runs:
+        decisions = [d for d in doc.get("decisions") or [] if isinstance(d, dict)]
+        if not decisions:
+            print(f"  {_iso(run_at)[:16]}  （无决策）")
+        for d in decisions:
+            reason = str(d.get("reason") or "").replace("\n", " ")[:80]
+            print(f"  {_iso(run_at)[:16]}  #{d.get('id')} {d.get('action')}  {reason}".rstrip())
+    if not runs:
+        print("  （还没有复盘记录）")
+    return 0
+
+
+def cmd_log(_args) -> int:
+    conn = connect()
+    runs = _recent_runs(conn, 10)
+    for run_at, doc in runs:
+        decisions = doc.get("decisions") or []
+        sent = _sent_ids(doc)
+        # The apply doc carries no mode; a run that decided or sent something was a review.
+        mode = "review" if decisions or sent else "capture"
+        print(f"{_iso(run_at)[:16]}  mode={mode:<7}  sent={len(sent)}  decisions={len(decisions)}")
+    if not runs:
+        print("（还没有复盘记录）")
+    return 0
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -655,6 +725,8 @@ def main() -> int:
     su.add_argument("--owner-id", default="")
     su.add_argument("--dm-target", default="")
     su.add_argument("--timezone", default="", help="IANA name, e.g. Asia/Shanghai")
+    su.add_argument("--include-groups", action=argparse.BooleanOptionalAction, default=None,
+                    help="also read group sessions (other members' messages included); default off")
     su.set_defaults(fn=cmd_setup)
 
     dmt = sub.add_parser("dm-target")
@@ -677,6 +749,12 @@ def main() -> int:
     w = sub.add_parser("watermark")
     w.add_argument("--set", default="")
     w.set_defaults(fn=cmd_watermark)
+
+    wy = sub.add_parser("why")
+    wy.set_defaults(fn=cmd_why)
+
+    lg = sub.add_parser("log")
+    lg.set_defaults(fn=cmd_log)
 
     args = ap.parse_args()
     rc = args.fn(args)

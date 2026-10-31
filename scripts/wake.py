@@ -7,7 +7,7 @@ cron `monitor` gate skips the agent run entirely.
 
 Conditions (v1)
 ---------------
-capture  last extraction > 3h ago and ≥8 new human messages  → update followups, never message
+capture  last capture ≥ 2h ago and ≥1 new owner message      → update followups, never message
 due      a followup's revisit_at has arrived                 → review it, maybe message
 hold     something is due but a message went out < 90 min ago → stay quiet this tick
 night    23:00–08:00                                          → capture only, never message
@@ -54,7 +54,7 @@ def home() -> Path:
 # Schema lives in followups.py only; sharing its connect() keeps every table in
 # place no matter which entry point touches the DB first.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from followups import connect  # noqa: E402
+from followups import chat_types, connect  # noqa: E402
 
 
 def get_kv(conn, k: str, default: float = 0.0) -> float:
@@ -109,21 +109,22 @@ def owner_id() -> str:
 
 
 def count_new_human(conn, since: float) -> int:
-    """Only the owner's own DM messages count — same filter the digest uses."""
+    """User turns in the owner's sessions — same chat types the digest reads."""
     state = home() / "state.db"
     if not state.exists():
         return 0
     owner = owner_id()
     if not owner:
         return 0
+    types = chat_types()
     c = sqlite3.connect(f"file:{state}?mode=ro", uri=True, timeout=30)
     try:
         return c.execute(
             "SELECT COUNT(*) FROM messages m JOIN sessions s ON s.id=m.session_id "
-            "WHERE m.timestamp>? AND m.role='user' AND s.chat_type IN ('dm','group') "
+            f"WHERE m.timestamp>? AND m.role='user' AND s.chat_type IN ({','.join('?' * len(types))}) "
             "AND s.user_id=? AND m.content NOT LIKE '[Cron delivery:%' "
             "AND m.content NOT LIKE '[INTERNAL%' AND m.content NOT LIKE '[ASYNC%'",
-            (since, owner),
+            (since, *types, owner),
         ).fetchone()[0]
     finally:
         c.close()
@@ -135,8 +136,12 @@ def main() -> int:
     hour = datetime.now(tz=local_tz()).hour
     night = hour < 8 or hour >= 23
 
+    # Two clocks: the watermark is the last message already digested (apply sets it
+    # to that message's time); kv.last_capture is when the last capture ran. Cadence
+    # follows last_capture; DBs from before apply wrote it fall back to the watermark.
     row = conn.execute("SELECT last_ts FROM watermark WHERE surface='messages'").fetchone()
-    last_capture = float(row["last_ts"]) if row else 0.0
+    watermark = float(row["last_ts"]) if row else 0.0
+    last_capture = get_kv(conn, "last_capture", watermark)
 
     if not owner_id():
         # No owner configured: wake once so the agent can say so, then stay quiet
@@ -148,10 +153,8 @@ def main() -> int:
 
     # 1) capture: cheap bookkeeping, never messages the user
     need_capture = (now - last_capture) >= CAPTURE_EVERY_S
-    if need_capture:
-        n = count_new_human(conn, last_capture)
-        if n >= MIN_NEW_MSGS or (n > 0 and now - last_capture > 8 * 3600):
-            feedback.append("capture")
+    if need_capture and count_new_human(conn, watermark) >= MIN_NEW_MSGS:
+        feedback.append("capture")
 
     # 2) due followups, minus categories the owner has muted by feedback
     muted = muted_whys(conn, now)

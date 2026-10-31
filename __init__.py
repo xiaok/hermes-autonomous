@@ -17,8 +17,8 @@ from pathlib import Path
 SCRIPT = Path(__file__).resolve().parent / "scripts" / "followups.py"
 
 _USAGE = (
-    "用法：/followups [list|due|close <id>|checked <id>|outcome <id> --value …]\n"
-    "不带参数 = 看全部（含已关闭）。"
+    "用法：/followups [list|due|why|log|close <id>|checked <id>|outcome <id> --value …]\n"
+    "不带参数 = 看全部（含已关闭）。why = 哪些类别被静默 + 最近决策；log = 最近 10 次复盘。"
 )
 
 
@@ -28,7 +28,7 @@ def _followups_command(raw_args: str) -> str:
         return f"找不到 {SCRIPT}（插件目录不完整）"
 
     args = (raw_args or "").split()
-    allowed = {"list", "due", "close", "checked", "outcome", "add"}
+    allowed = {"list", "due", "close", "checked", "outcome", "add", "why", "log"}
     sub = args[0] if args and args[0] in allowed else "list"
     cmd = [sys.executable, str(SCRIPT), sub]
     if sub == "list" and "--all" not in args:
@@ -51,7 +51,7 @@ def register(ctx) -> None:
         "followups",
         _followups_command,
         description="Show or edit the proactive follow-up board (what I'm quietly tracking)",
-        args_hint="[list|due|close <id>|checked <id>]",
+        args_hint="[list|due|why|log|close <id>|checked <id>]",
     )
 
 

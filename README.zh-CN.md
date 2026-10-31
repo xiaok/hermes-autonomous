@@ -95,13 +95,13 @@ python3 ~/opt/hermes-autonomous/scripts/followups.py setup --owner-id … --dm-t
 
 ## 你的数据
 
-- 只读**你自己**发的消息（你的私聊、你自己建的话题）。别人的文字不会进入模型。
+- 只读属于**你的 user id** 的会话，默认只读你和 Hermes 的私聊：你发的消息加 Hermes 的回复。群聊默认不读；`followups.py setup --include-groups` 打开后，你的群聊会话会整段读入——包括群里其他人说的话。
 - 状态存在 `~/.hermes/plugin-data/hermes-autonomous/`（SQLite + 配置，权限 0600），不进仓库。
 - 仓库里**没有**任何 id、名字、聊天记录或个人场景——都在本地配置。
 
 ## 它碰了什么（披露）
 
-- **读**：Hermes 的会话库 `~/.hermes/state.db`，只读，且只读**你自己**在私聊和本人话题里发的消息；不读其他文件。
+- **读**：Hermes 的会话库 `~/.hermes/state.db`，只读，且只读属于你 user id 的会话：私聊里的用户与助手消息；群聊会话（含其他成员的消息）仅在打开 `include_groups` 后读取。不读其他文件。
 - **写**：只有自己的数据目录 `~/.hermes/plugin-data/hermes-autonomous/`（SQLite 跟进表 + `settings.json`，权限 0600）。
 - **网络**：插件代码本身不发任何请求。复盘时 agent 可能用 Hermes 自带工具查天气/价格/新闻——那是 Hermes 的流量，不是这个插件的。
 - **Shell**：`/followups` 只用 `sys.executable` 跑一个本地 Python 脚本；cron 那侧也是纯 Python。不 spawn `hermes`、不注册 hook、没有后台线程、不绕过审批。

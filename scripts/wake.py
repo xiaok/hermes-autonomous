@@ -1,0 +1,157 @@
+#!/usr/bin/env python3
+"""Cheap, deterministic wake-gate for the proactivity layer.
+
+Runs every few minutes with **no LLM**. Prints a small JSON blob only when there
+is a reason to wake the agent; otherwise prints the constant ``quiet`` so Hermes'
+cron `monitor` gate skips the agent run entirely.
+
+Conditions (v1)
+---------------
+capture  last extraction > 3h ago and ≥8 new human messages  → update followups, never message
+due      a followup's revisit_at has arrived                 → review it, maybe message
+hold     something is due but a message went out < 90 min ago → stay quiet this tick
+night    23:00–08:00                                          → capture only, never message
+
+Output is timestamp-free on purpose: identical output must mean "nothing new".
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import sqlite3
+import sys
+import time
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+JST = timezone(timedelta(hours=9))
+CAPTURE_EVERY_S = 2 * 3600   # owner sends few messages; 8 was unreachable
+MIN_NEW_MSGS = 1
+SEND_COOLDOWN_S = 90 * 60
+
+QUIET = "quiet"
+
+
+def home() -> Path:
+    return Path(os.environ.get("HERMES_HOME") or (Path.home() / ".hermes"))
+
+
+def connect() -> sqlite3.Connection:
+    p = home() / "plugin-data" / "hermes-autonomous" / "followups.db"
+    p.parent.mkdir(parents=True, exist_ok=True)
+    c = sqlite3.connect(p, timeout=30, isolation_level=None)
+    c.row_factory = sqlite3.Row
+    c.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS kv (k TEXT PRIMARY KEY, v TEXT);
+        CREATE TABLE IF NOT EXISTS followups (
+          id INTEGER PRIMARY KEY AUTOINCREMENT, key TEXT UNIQUE, kind TEXT, why TEXT,
+          subject TEXT, quote TEXT, hint TEXT, revisit_at REAL,
+          status TEXT DEFAULT 'active', checks INTEGER DEFAULT 0, last_checked REAL,
+          note TEXT, created_at REAL);
+        """
+    )
+    cols = {r["name"] for r in c.execute("PRAGMA table_info(followups)")}
+    for name, decl in (("sent_at", "REAL"), ("sent_msg_id", "TEXT"), ("outcome", "TEXT")):
+        if name not in cols:
+            c.execute(f"ALTER TABLE followups ADD COLUMN {name} {decl}")
+    return c
+
+
+def get_kv(conn, k: str, default: float = 0.0) -> float:
+    r = conn.execute("SELECT v FROM kv WHERE k=?", (k,)).fetchone()
+    try:
+        return float(r["v"]) if r else default
+    except (TypeError, ValueError):
+        return default
+
+
+def set_kv(conn, k: str, v: float) -> None:
+    conn.execute("INSERT INTO kv(k,v) VALUES(?,?) ON CONFLICT(k) DO UPDATE SET v=excluded.v",
+                 (k, str(v)))
+
+
+def owner_id() -> str:
+    """Owner id comes from settings.json / env, never from the repo."""
+    val = os.environ.get("AUTONOMY_OWNER_ID", "")
+    if val:
+        return val
+    p = home() / "plugin-data" / "hermes-autonomous" / "settings.json"
+    try:
+        return str(json.loads(p.read_text(encoding="utf-8")).get("owner_id") or "")
+    except Exception:
+        return ""
+
+
+def count_new_human(conn, since: float) -> int:
+    """Only the owner's own DM messages count — same filter the digest uses."""
+    state = home() / "state.db"
+    if not state.exists():
+        return 0
+    owner = owner_id()
+    if not owner:
+        return 0
+    c = sqlite3.connect(f"file:{state}?mode=ro", uri=True, timeout=30)
+    try:
+        return c.execute(
+            "SELECT COUNT(*) FROM messages m JOIN sessions s ON s.id=m.session_id "
+            "WHERE m.timestamp>? AND m.role='user' AND s.chat_type IN ('dm','group') "
+            "AND s.user_id=? AND m.content NOT LIKE '[Cron delivery:%' "
+            "AND m.content NOT LIKE '[INTERNAL%' AND m.content NOT LIKE '[ASYNC%'",
+            (since, owner),
+        ).fetchone()[0]
+    finally:
+        c.close()
+
+
+def main() -> int:
+    conn = connect()
+    now = time.time()
+    hour = datetime.now(tz=JST).hour
+    night = hour < 8 or hour >= 23
+
+    row = conn.execute("SELECT last_ts FROM watermark WHERE surface='messages'").fetchone()
+    last_capture = float(row["last_ts"]) if row else 0.0
+
+    if not owner_id():
+        # No owner configured: wake once so the agent can say so, then stay quiet
+        # (the payload is constant, so the monitor gate suppresses repeats).
+        print('{"mode": "setup-needed"}')
+        return 0
+
+    feedback = []
+
+    # 1) capture: cheap bookkeeping, never messages the user
+    need_capture = (now - last_capture) >= CAPTURE_EVERY_S
+    if need_capture:
+        n = count_new_human(conn, last_capture)
+        if n >= MIN_NEW_MSGS or (n > 0 and now - last_capture > 8 * 3600):
+            feedback.append("capture")
+
+    # 2) due followups
+    due = conn.execute(
+        "SELECT id FROM followups WHERE status='active' AND COALESCE(revisit_at,0)<=? "
+        "AND (sent_at IS NULL OR sent_at < revisit_at) "
+        "ORDER BY revisit_at LIMIT 10", (now,)
+    ).fetchall()
+    due_ids = [r["id"] for r in due]
+    if due_ids:
+        last_send = get_kv(conn, "last_send", 0.0)
+        cooling = (now - last_send) < SEND_COOLDOWN_S
+        feedback.append("due-hold" if (cooling or night) else "due")
+        if due_ids and not (cooling or night):
+            print(json.dumps({"mode": "review", "ids": due_ids, "night": False}))
+            return 0
+
+    # 3) capture-only wake
+    if feedback and "capture" in feedback:
+        print(json.dumps({"mode": "capture", "night": night}))
+        return 0
+
+    print(QUIET)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

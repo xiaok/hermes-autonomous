@@ -1,0 +1,22 @@
+{
+  "name": "utility: meeting in Beijing tomorrow 15:00 (due next morning)",
+  "now": "2026-11-01T09:30:00+09:00",
+  "history": [
+    {
+      "t": "2026-10-31 13:22",
+      "role": "user",
+      "text": "我明天下午3点要去北京见人"
+    }
+  ],
+  "followups": [
+    {
+      "id": 7,
+      "why": "utility",
+      "subject": "今天 15:00 北京见人",
+      "quote": "我明天下午3点要去北京见人",
+      "revisit_at": "2026-11-01T09:00:00+09:00",
+      "sent_at": null,
+      "checks": 0
+    }
+  ]
+}

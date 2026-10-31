@@ -1,0 +1,17 @@
+{
+  "name": "curiosity: legislation still in progress",
+  "now": "2026-10-31T14:10:00+09:00",
+  "history": [
+    {
+      "t": "2026-10-31 14:05",
+      "role": "user",
+      "text": "这条新闻是真的吗？国民议会通过了一项按每 GB 收 5.5 欧分的修正案"
+    },
+    {
+      "t": "2026-10-31 14:07",
+      "role": "assistant",
+      "text": "真的，10 月 30 日一读通过 11:10，下一步参议院。"
+    }
+  ],
+  "followups": []
+}

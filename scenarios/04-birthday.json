@@ -1,0 +1,12 @@
+{
+  "name": "care: birthday reminder (capture)",
+  "now": "2026-12-01T13:30:00+09:00",
+  "history": [
+    {
+      "t": "2026-12-01 13:28",
+      "role": "user",
+      "text": "我 3月14号生日"
+    }
+  ],
+  "followups": []
+}

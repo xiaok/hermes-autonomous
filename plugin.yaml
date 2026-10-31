@@ -1,0 +1,13 @@
+name: hermes-autonomous
+version: "0.3.0"
+description: "Proactivity layer for Hermes: reviews past conversations, finds follow-ups worth returning to (care/utility/risk/curiosity), then acts or asks — with hard noise limits."
+author: xiaok
+provides_tools:
+  - autonomy_enqueue
+  - autonomy_list
+  - autonomy_claim
+  - autonomy_finish
+  - autonomy_status
+  - autonomy_control
+provides_commands:
+  - autonomy

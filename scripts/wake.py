@@ -51,26 +51,10 @@ def home() -> Path:
     return Path(os.environ.get("HERMES_HOME") or (Path.home() / ".hermes"))
 
 
-def connect() -> sqlite3.Connection:
-    p = home() / "plugin-data" / "hermes-autonomous" / "followups.db"
-    p.parent.mkdir(parents=True, exist_ok=True)
-    c = sqlite3.connect(p, timeout=30, isolation_level=None)
-    c.row_factory = sqlite3.Row
-    c.executescript(
-        """
-        CREATE TABLE IF NOT EXISTS kv (k TEXT PRIMARY KEY, v TEXT);
-        CREATE TABLE IF NOT EXISTS followups (
-          id INTEGER PRIMARY KEY AUTOINCREMENT, key TEXT UNIQUE, kind TEXT, why TEXT,
-          subject TEXT, quote TEXT, hint TEXT, revisit_at REAL,
-          status TEXT DEFAULT 'active', checks INTEGER DEFAULT 0, last_checked REAL,
-          note TEXT, created_at REAL);
-        """
-    )
-    cols = {r["name"] for r in c.execute("PRAGMA table_info(followups)")}
-    for name, decl in (("sent_at", "REAL"), ("sent_msg_id", "TEXT"), ("outcome", "TEXT")):
-        if name not in cols:
-            c.execute(f"ALTER TABLE followups ADD COLUMN {name} {decl}")
-    return c
+# Schema lives in followups.py only; sharing its connect() keeps every table in
+# place no matter which entry point touches the DB first.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from followups import connect  # noqa: E402
 
 
 def get_kv(conn, k: str, default: float = 0.0) -> float:

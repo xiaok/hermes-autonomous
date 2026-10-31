@@ -323,6 +323,7 @@ def cmd_setup(args) -> int:
     settings_path().write_text(json.dumps(cur, indent=2), encoding="utf-8")
     saved = settings_path()
     os.chmod(saved, 0o600)
+    connect().close()  # create the DB + schema so digest/wake work right after setup
     print(json.dumps({"ok": True, "path": str(saved), "settings": cur}, ensure_ascii=False))
     return 0
 

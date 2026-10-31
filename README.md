@@ -16,17 +16,22 @@ It is not a digest. It is not a task list. It does not require you to configure 
 
 ---
 
-## Install (about 2 minutes, no coding)
+## Install
 
-It is an ordinary Hermes plugin, so the install is one command:
+You don't install anything. Just tell your agent:
+
+> Install the plugin `xiaok/hermes-autonomous`, enable it, configure it for this chat, and create the
+> review cron job.
+
+It installs the plugin, writes your local settings, copies the cron helpers and schedules the loop.
+Nothing identifying lives in this repo — your ids end up in
+`~/.hermes/plugin-data/hermes-autonomous/settings.json` (mode 0600), on your machine only.
+
+<details>
+<summary>Manual install — five commands (if your agent can't do it)</summary>
 
 ```bash
 hermes plugins install xiaok/hermes-autonomous --enable
-```
-
-Then four more lines wire it to your chat and schedule the loop:
-
-```bash
 PLUGIN=~/.hermes/plugins/hermes-autonomous
 python3 $PLUGIN/scripts/followups.py setup --owner-id <id> --dm-target telegram:<id>
 cp $PLUGIN/cron/*.py ~/.hermes/scripts/
@@ -38,19 +43,19 @@ hermes cron create "*/15 * * * *" --name "proactive follow-ups" \
 Don't know your Telegram id? Message [@userinfobot](https://t.me/userinfobot), or ask Hermes — it can
 read the id of the conversation it is in.
 
-Or simply tell your agent:
+</details>
 
-> Install the plugin `xiaok/hermes-autonomous`, enable it, configure it for the chat we are in, and
-> create the review cron job.
-
-### From source (development)
+<details>
+<summary>From source (development)</summary>
 
 ```bash
 git clone https://github.com/xiaok/hermes-autonomous.git ~/opt/hermes-autonomous
 ln -s ~/opt/hermes-autonomous ~/.hermes/plugins/hermes-autonomous
-hermes plugins enable hermes-autonomous      # tools load on the next session
+hermes plugins enable hermes-autonomous
 python3 ~/opt/hermes-autonomous/scripts/followups.py setup --owner-id … --dm-target …
 ```
+
+</details>
 
 ---
 

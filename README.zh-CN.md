@@ -12,17 +12,20 @@
 
 ---
 
-## 安装（约两分钟，不用写代码）
+## 安装
 
-它就是一个普通 Hermes 插件，安装只要一行：
+你不用装任何东西，直接跟你的 agent 说：
+
+> 帮我装插件 `xiaok/hermes-autonomous` 并启用，配好当前这个会话，然后建好复盘的定时任务。
+
+它会自己完成安装、写本地配置、拷 cron 脚本、建好任务。仓库里不存任何身份信息——你的 id 只落在本机的
+`~/.hermes/plugin-data/hermes-autonomous/settings.json`（权限 0600）。
+
+<details>
+<summary>手动安装 —— 五条命令（agent 搞不定时再用）</summary>
 
 ```bash
 hermes plugins install xiaok/hermes-autonomous --enable
-```
-
-再把下面四行填好，把它接到你的聊天并挂上定时任务：
-
-```bash
 PLUGIN=~/.hermes/plugins/hermes-autonomous
 python3 $PLUGIN/scripts/followups.py setup --owner-id <你的 Telegram user id> --dm-target telegram:<chat_id>
 cp $PLUGIN/cron/*.py ~/.hermes/scripts/
@@ -33,18 +36,19 @@ hermes cron create "*/15 * * * *" --name "主动跟进" \
 
 不知道自己的 id？找 [@userinfobot](https://t.me/userinfobot)，或者直接问 Hermes——它知道当前会话的 id。
 
-也可以直接跟你的 agent 说：
+</details>
 
-> 帮我装插件 `xiaok/hermes-autonomous` 并启用，配好当前这个会话，然后建好复盘的定时任务。
-
-### 从源码安装（开发用）
+<details>
+<summary>从源码安装（开发用）</summary>
 
 ```bash
 git clone https://github.com/xiaok/hermes-autonomous.git ~/opt/hermes-autonomous
 ln -s ~/opt/hermes-autonomous ~/.hermes/plugins/hermes-autonomous
-hermes plugins enable hermes-autonomous          # 工具下个会话生效
+hermes plugins enable hermes-autonomous
 python3 ~/opt/hermes-autonomous/scripts/followups.py setup --owner-id … --dm-target …
 ```
+
+</details>
 
 ---
 

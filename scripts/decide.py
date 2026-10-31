@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -21,18 +22,33 @@ import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-JST = timezone(timedelta(hours=9))
+def local_tz():
+    name = os.environ.get("AUTONOMY_TZ") or ""
+    if not name:
+        try:
+            p = Path(os.environ.get("HERMES_HOME") or (Path.home() / ".hermes")) / \
+                "plugin-data" / "hermes-autonomous" / "settings.json"
+            name = json.loads(p.read_text(encoding="utf-8")).get("timezone") or ""
+        except Exception:
+            name = ""
+    if name:
+        try:
+            from zoneinfo import ZoneInfo
+            return ZoneInfo(str(name))
+        except Exception:
+            pass
+    return datetime.now().astimezone().tzinfo or timezone.utc
 ROOT = Path(__file__).resolve().parent.parent
 CHAT = shutil.which("hermes") or str(Path.home() / ".hermes/hermes-agent/.hermes/bin/hermes")
 
 
 def parse_now(s: str | None) -> datetime:
     if not s:
-        return datetime.now(tz=JST)
+        return datetime.now(tz=local_tz())
     if s.lower() == "now":
-        return datetime.now(tz=JST)
+        return datetime.now(tz=local_tz())
     d = datetime.fromisoformat(s)
-    return d if d.tzinfo else d.replace(tzinfo=JST)
+    return d if d.tzinfo else d.replace(tzinfo=local_tz())
 
 
 def parse_when(s: str, now: datetime) -> datetime:
@@ -45,7 +61,7 @@ def parse_when(s: str, now: datetime) -> datetime:
     if s.lower() == "now":
         return now
     d = datetime.fromisoformat(s)
-    return d if d.tzinfo else d.replace(tzinfo=JST)
+    return d if d.tzinfo else d.replace(tzinfo=local_tz())
 
 
 def build_prompt(scenario: dict, now: datetime) -> str:

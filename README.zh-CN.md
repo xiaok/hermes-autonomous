@@ -25,7 +25,7 @@
 ```bash
 hermes plugins install xiaok/hermes-autonomous --enable
 PLUGIN=~/.hermes/plugins/hermes-autonomous
-python3 $PLUGIN/scripts/followups.py setup --owner-id <你的 Telegram user id> --dm-target telegram:<chat_id>
+python3 $PLUGIN/scripts/followups.py setup --owner-id <你的 Telegram user id> --dm-target telegram:<chat_id> --timezone Asia/Shanghai
 cp $PLUGIN/cron/*.py ~/.hermes/scripts/
 hermes cron create "*/15 * * * *" --name "主动跟进" \
   --monitor-script followup-wake.py --script followup-digest.py \
@@ -33,6 +33,8 @@ hermes cron create "*/15 * * * *" --name "主动跟进" \
 ```
 
 不知道自己的 id？找 [@userinfobot](https://t.me/userinfobot)，或者直接问 Hermes——它知道当前会话的 id。
+
+`--timezone` 填 IANA 名称（`Asia/Tokyo`、`Europe/Berlin`…），不填就用机器本地时区。代码里没有任何硬编码时区——**提醒早了一小时，永远先查时区设置，不是调度 bug**。
 
 ### 从源码安装（开发用）
 

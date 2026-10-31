@@ -28,7 +28,22 @@ import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-JST = timezone(timedelta(hours=9))
+def local_tz():
+    """Timezone: explicit setting > AUTONOMY_TZ > system local. Never hardcode a zone."""
+    name = os.environ.get("AUTONOMY_TZ") or ""
+    try:
+        name = name or (load_settings() or {}).get("timezone") or ""
+    except Exception:
+        name = name or ""
+    if name:
+        try:
+            from zoneinfo import ZoneInfo
+            return ZoneInfo(str(name))
+        except Exception:
+            pass
+    return datetime.now().astimezone().tzinfo or timezone.utc
+
+
 MAX_MSG_CHARS = 1200
 MAX_MESSAGES = 250
 
@@ -58,6 +73,11 @@ def setting(key: str, env: str) -> str:
             f"not configured: {key}. Run: followups.py setup --owner-id <telegram_user_id> "
             f"--dm-target telegram:<chat_id>  (or set {env})")
     return str(val)
+
+
+def _is_night() -> bool:
+    hour = datetime.now(tz=local_tz()).hour
+    return hour < 8 or hour >= 23
 
 
 def owner_id() -> str:
@@ -121,7 +141,7 @@ def connect() -> sqlite3.Connection:
 def _iso(ts: float | None) -> str:
     if not ts:
         return ""
-    return datetime.fromtimestamp(ts, JST).isoformat(timespec="minutes")
+    return datetime.fromtimestamp(ts, local_tz()).isoformat(timespec="minutes")
 
 
 def _parse(when: str) -> float:
@@ -135,7 +155,7 @@ def _parse(when: str) -> float:
         return time.time() + float(when[1:-1]) * 86400
     d = datetime.fromisoformat(when)
     if d.tzinfo is None:
-        d = d.replace(tzinfo=JST)
+        d = d.replace(tzinfo=local_tz())
     return d.timestamp()
 
 
@@ -220,7 +240,7 @@ def cmd_digest(args) -> int:
         "followups": active,
         "due_count": sum(1 for f in active if f["due"]),
         "mode": "review" if any(f["due"] for f in active) else "capture",
-        "night": datetime.now(tz=JST).hour < 8 or datetime.now(tz=JST).hour >= 23,
+        "night": _is_night(),
         "instructions": "见 prompts/review.md：先更新 followups，再挑 due 的处理，最后私聊 + 开发日志。",
     }
     print(json.dumps(payload, ensure_ascii=False))
@@ -298,6 +318,8 @@ def cmd_setup(args) -> int:
         cur["owner_id"] = str(args.owner_id)
     if args.dm_target:
         cur["dm_target"] = str(args.dm_target)
+    if args.timezone:
+        cur["timezone"] = str(args.timezone)
     settings_path().write_text(json.dumps(cur, indent=2), encoding="utf-8")
     saved = settings_path()
     os.chmod(saved, 0o600)
@@ -425,6 +447,7 @@ def main() -> int:
     su = sub.add_parser("setup")
     su.add_argument("--owner-id", default="")
     su.add_argument("--dm-target", default="")
+    su.add_argument("--timezone", default="", help="IANA name, e.g. Asia/Shanghai")
     su.set_defaults(fn=cmd_setup)
 
     dmt = sub.add_parser("dm-target")

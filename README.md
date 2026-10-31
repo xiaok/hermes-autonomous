@@ -31,7 +31,7 @@ in this repo; it all lives in your own `~/.hermes`.
 ```bash
 hermes plugins install xiaok/hermes-autonomous --enable
 PLUGIN=~/.hermes/plugins/hermes-autonomous
-python3 $PLUGIN/scripts/followups.py setup --owner-id <id> --dm-target telegram:<id>
+python3 $PLUGIN/scripts/followups.py setup --owner-id <id> --dm-target telegram:<id> --timezone Asia/Shanghai
 cp $PLUGIN/cron/*.py ~/.hermes/scripts/
 hermes cron create "*/15 * * * *" --name "proactive follow-ups" \
   --monitor-script followup-wake.py --script followup-digest.py \
@@ -40,6 +40,10 @@ hermes cron create "*/15 * * * *" --name "proactive follow-ups" \
 
 Don't know your Telegram id? Message [@userinfobot](https://t.me/userinfobot), or ask Hermes — it can
 read the id of the conversation it is in.
+
+`--timezone` takes an IANA name (`Asia/Tokyo`, `Europe/Berlin`, …). Leave it out and the machine's own
+timezone is used. Nothing is hardcoded — reminders firing an hour early is always a timezone setting,
+not a schedule bug.
 
 ### From source (development)
 

@@ -25,7 +25,21 @@ import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-JST = timezone(timedelta(hours=9))
+def local_tz():
+    name = os.environ.get("AUTONOMY_TZ") or ""
+    if not name:
+        try:
+            p = home() / "plugin-data" / "hermes-autonomous" / "settings.json"
+            name = json.loads(p.read_text(encoding="utf-8")).get("timezone") or ""
+        except Exception:
+            name = ""
+    if name:
+        try:
+            from zoneinfo import ZoneInfo
+            return ZoneInfo(str(name))
+        except Exception:
+            pass
+    return datetime.now().astimezone().tzinfo or timezone.utc
 CAPTURE_EVERY_S = 2 * 3600   # owner sends few messages; 8 was unreachable
 MIN_NEW_MSGS = 1
 SEND_COOLDOWN_S = 90 * 60
@@ -108,7 +122,7 @@ def count_new_human(conn, since: float) -> int:
 def main() -> int:
     conn = connect()
     now = time.time()
-    hour = datetime.now(tz=JST).hour
+    hour = datetime.now(tz=local_tz()).hour
     night = hour < 8 or hour >= 23
 
     row = conn.execute("SELECT last_ts FROM watermark WHERE surface='messages'").fetchone()

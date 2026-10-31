@@ -54,7 +54,7 @@ def home() -> Path:
 # Schema lives in followups.py only; sharing its connect() keeps every table in
 # place no matter which entry point touches the DB first.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from followups import chat_types, connect  # noqa: E402
+from followups import chat_types, connect, muted_whys  # noqa: E402
 
 
 def get_kv(conn, k: str, default: float = 0.0) -> float:
@@ -68,32 +68,6 @@ def get_kv(conn, k: str, default: float = 0.0) -> float:
 def set_kv(conn, k: str, v: float) -> None:
     conn.execute("INSERT INTO kv(k,v) VALUES(?,?) ON CONFLICT(k) DO UPDATE SET v=excluded.v",
                  (k, str(v)))
-
-
-MUTE_WINDOW_S = 30 * 86400
-MUTE_IGNORED_AFTER = 3
-
-
-def muted_whys(conn, now: float | None = None) -> dict[str, str]:
-    """Categories (``why``) the owner has pushed back on in the last 30 days.
-
-    One ``annoyed`` or three ``ignored`` on sent followups mutes that category:
-    its items stay in the table but no longer wake the agent into review.
-    """
-    now = time.time() if now is None else now
-    rows = conn.execute(
-        "SELECT why, outcome, COUNT(*) AS n FROM followups "
-        "WHERE sent_at IS NOT NULL AND sent_at>=? AND why IS NOT NULL "
-        "AND outcome IN ('annoyed','ignored') GROUP BY why, outcome",
-        (now - MUTE_WINDOW_S,),
-    ).fetchall()
-    muted: dict[str, str] = {}
-    for r in rows:
-        if r["outcome"] == "annoyed":
-            muted[r["why"]] = "annoyed"
-        elif r["n"] >= MUTE_IGNORED_AFTER:
-            muted.setdefault(r["why"], f"ignored*{r['n']}")
-    return muted
 
 
 def owner_id() -> str:

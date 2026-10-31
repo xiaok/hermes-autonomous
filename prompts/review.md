@@ -135,7 +135,8 @@ python3 "$PLUGIN/scripts/followups.py" apply <<'JSON'
   "close": [{"id": 4, "note": "已经结束"}],
   "decisions": [
     {"id": 7, "action": "silent", "reason": "体检结果没新消息", "snooze": "+2d"},
-    {"id": 12, "action": "act_report", "reason": "明天降水 80%"}
+    {"id": 12, "action": "act_report", "reason": "明天降水 80%",
+     "score": {"relevance": 2, "change": 1, "action": 1, "timing": 2, "risk": 0}}
   ],
   "sent": {"id": 12, "msg_id": "2311"},
   "watermark": 1761800123.456789
@@ -145,6 +146,7 @@ JSON
 
 - `new_followups` 每项必须有 `key`、`why`、`kind`、`subject`、`revisit_at`；`quote`、`hint` 可选。
 - `decisions` / `outcomes` / `close` / `sent` 里的 `id` 必须是 `followups` 里真实存在的 id。
+- `decisions` 每项可带 `score`（对象，同 decide.md 的打分），只记进日志，不影响写库。
 - 没有的部分给空列表或 `null`；`watermark` 必须有。
 - 输出 `"ok": true` 才算写进去了。`"ok": false` = **什么都没写**，按 `error` 改正后重新 apply；
   别因为 apply 失败就重发私聊——已经发出的那条，把同一个 msg_id 填回去即可。

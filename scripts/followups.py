@@ -227,8 +227,35 @@ def _messages_since(since: float) -> tuple[list[dict], float | None]:
     return out, last_ts
 
 
+MUTE_WINDOW_S = 30 * 86400
+MUTE_IGNORED_AFTER = 3
+
+
+def muted_whys(conn, now: float | None = None) -> dict[str, str]:
+    """Categories (``why``) the owner has pushed back on in the last 30 days.
+
+    One ``annoyed`` or three ``ignored`` on sent followups mutes that category:
+    its items stay in the table but no longer wake the agent into review.
+    Lives here, not in wake.py: cron runs this file via runpy with no sys.path
+    entry for scripts/, so it must never import its siblings.
+    """
+    now = time.time() if now is None else now
+    rows = conn.execute(
+        "SELECT why, outcome, COUNT(*) AS n FROM followups "
+        "WHERE sent_at IS NOT NULL AND sent_at>=? AND why IS NOT NULL "
+        "AND outcome IN ('annoyed','ignored') GROUP BY why, outcome",
+        (now - MUTE_WINDOW_S,),
+    ).fetchall()
+    muted: dict[str, str] = {}
+    for r in rows:
+        if r["outcome"] == "annoyed":
+            muted[r["why"]] = "annoyed"
+        elif r["n"] >= MUTE_IGNORED_AFTER:
+            muted.setdefault(r["why"], f"ignored*{r['n']}")
+    return muted
+
+
 def cmd_digest(args) -> int:
-    from wake import muted_whys  # lazy: wake.py imports this module at load time
     conn = connect()
     wm = since = _get_wm(conn)
     if args.hours:
@@ -530,7 +557,10 @@ def _apply(conn, doc: dict) -> dict:
     seen: set[int] = set()
     for i, d in enumerate(_list(doc, "decisions")):
         where = f"decisions[{i}]"
-        _obj(d, where, ("id", "action", "reason", "snooze"))
+        _obj(d, where, ("id", "action", "reason", "snooze", "score"))
+        # score is the decider's rubric: not interpreted, only kept in the log payload.
+        if "score" in d and not isinstance(d["score"], dict):
+            raise ApplyError(f"{where}: score must be an object")
         fid = _id(conn, d.get("id"), where)
         if fid in seen:
             raise ApplyError(f"{where}: duplicate decision for followup {fid}")
@@ -643,7 +673,6 @@ def _sent_ids(doc: dict) -> list:
 
 
 def cmd_why(_args) -> int:
-    from wake import MUTE_IGNORED_AFTER, muted_whys  # lazy: wake.py imports this module
     conn = connect()
     muted = muted_whys(conn)
     print(f"静默中的类别（近 30 天：annoyed 1 次 / ignored {MUTE_IGNORED_AFTER} 次即静默）：")

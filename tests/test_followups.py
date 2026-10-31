@@ -153,6 +153,19 @@ class FreshInstall(Home):
         self.assertEqual(d2["messages"], [])
         self.assertEqual(d2["next_watermark"], wm + 7.987654321)
 
+    def test_cron_digest_wrapper(self):
+        # runpy.run_path does not put scripts/ on sys.path: followups.py must not
+        # import its siblings. Install this checkout where the wrapper looks first.
+        self.setup_owner()
+        plugins = self.home / "plugins"
+        plugins.mkdir()
+        (plugins / "hermes-autonomous").symlink_to(ROOT, target_is_directory=True)
+        env = {k: v for k, v in self.env.items() if k != "PYTHONPATH"}
+        p = subprocess.run([sys.executable, str(ROOT / "cron" / "followup-digest.py")],
+                           capture_output=True, text=True, env=env, cwd=self.home, timeout=30)
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertEqual(json.loads(p.stdout)["mode"], "capture")
+
 
 class Apply(Home):
     def setUp(self):
@@ -242,6 +255,15 @@ class Apply(Home):
         for col in ("sent_at", "sent_msg_id", "checks", "outcome", "status", "created_at"):
             self.assertEqual(after[col], before[col], col)
 
+    def test_decision_score_is_logged_verbatim(self):
+        fid = self.add("x")
+        score = {"relevance": 2, "change": 1, "action": 1, "timing": 2, "risk": 0}
+        doc = {"decisions": [{"id": fid, "action": "silent", "reason": "r", "score": score}],
+               "watermark": 1.0}
+        self.apply(doc)
+        payload = self.db().execute("SELECT payload FROM log").fetchone()[0]
+        self.assertEqual(json.loads(payload)["decisions"][0]["score"], score)
+
     def test_outcomes_and_close(self):
         a, b = self.add("a"), self.add("b")
         self.apply({"outcomes": [{"id": a, "value": "accepted", "close": True}],
@@ -297,6 +319,10 @@ class ApplyRollback(Home):
 
     def test_bad_action(self):
         self.assert_rejected(self.good(decisions=[{"id": self.fid, "action": "close"}]), "action")
+
+    def test_score_not_an_object(self):
+        d = [{"id": self.fid, "action": "silent", "reason": "r", "score": 7}]
+        self.assert_rejected(self.good(decisions=d), "score")
 
     def test_sent_without_msg_id(self):
         self.assert_rejected(self.good(decisions=[], sent={"id": self.fid, "msg_id": ""}),

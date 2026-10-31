@@ -89,8 +89,13 @@ def owner_id() -> str:
 
 def chat_types() -> tuple[str, ...]:
     """DM sessions only, unless setup --include-groups: in a group, other members'
-    messages land in the owner's session too, so reading groups is opt-in."""
-    return ("dm", "group") if (load_settings() or {}).get("include_groups") is True else ("dm",)
+    messages land in the owner's session too, so reading groups is opt-in. Discord
+    (and Slack) threads are group-like — several members can post in one thread, and
+    Hermes records them as chat_type='thread' — so they follow the same switch
+    instead of adding a third flag that would only be forgotten."""
+    if (load_settings() or {}).get("include_groups") is True:
+        return ("dm", "group", "thread")
+    return ("dm",)
 
 
 def dm_target() -> str:

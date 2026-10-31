@@ -3,7 +3,14 @@
 你不是被闹钟叫醒的，是**被条件叫醒的**。上方已注入本次的 JSON（`scripts/followups.py digest`）：
 `mode`（`capture` 或 `review`）、`night`、`now`、`watermark`、`messages`（自上次以来的对话）、`followups`、`due_count`。
 
-工具：`hermes`（发消息）、`python3 ~/opt/hermes-autonomous/scripts/followups.py …`（读写跟进点）。
+先确定插件根目录（两种安装方式都覆盖）：
+
+```bash
+PLUGIN=${PLUGIN:-$HOME/.hermes/plugins/hermes-autonomous}
+[ -d "$PLUGIN" ] || PLUGIN=$HOME/opt/hermes-autonomous
+```
+
+工具：`hermes`（发消息）、`python3 "$PLUGIN/scripts/followups.py" …`（读写跟进点）。
 
 ## 0. 先看 mode
 
@@ -36,7 +43,7 @@
 一次最多处理 5 条，宁少勿滥。做完**立刻**：
 
 ```bash
-python3 ~/opt/hermes-autonomous/scripts/followups.py mark --capture
+python3 "$PLUGIN/scripts/followups.py" mark --capture
 ```
 
 `mark --capture` 同时推进水位（只有一个游标），不推进的话唤醒门会一直响。
@@ -77,10 +84,10 @@ python3 ~/opt/hermes-autonomous/scripts/followups.py mark --capture
 一次最多 3 项、总共不超过 6 行。发完立刻登记回执：
 
 ```bash
-TARGET=$(python3 ~/opt/hermes-autonomous/scripts/followups.py dm-target)
+TARGET=$(python3 "$PLUGIN/scripts/followups.py" dm-target)
 out=$(hermes send --to "$TARGET" --json "文本")
 mid=$(printf '%s' "$out" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("message_id",""))')
-python3 ~/opt/hermes-autonomous/scripts/followups.py sent <id> --msg-id "$mid"
+python3 "$PLUGIN/scripts/followups.py" sent <id> --msg-id "$mid"
 ```
 
 （`hermes send` 发出去的消息**不写进 state.db**，`sent` 记录是唯一回执。没登记 = 没发过。）

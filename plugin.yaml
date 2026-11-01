@@ -1,5 +1,5 @@
 name: hermes-autonomous
-version: "0.5.3"
+version: "0.5.4"
 description: "Proactive follow-ups for Hermes: it reviews recent conversations, finds things worth returning to (care / utility / risk / curiosity), then stays silent, acts and reports, or asks — with hard noise limits."
 author: xiaok
 update_url: https://github.com/xiaok/hermes-autonomous

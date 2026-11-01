@@ -123,6 +123,7 @@ def apply_gates(result: dict, scenario: dict, now: datetime) -> dict:
         result.setdefault("silent_actions", []).append(
             f"消息被闸门拦下（{'夜间' if night else '冷却中'}）：{msg[:60]}…")
         result["message"] = None
+        msg = None
     if msg:
         blocks = [b for b in re.split(r"\n(?=\S{0,2}?\S*[：:])", msg.strip()) if b.strip()]
         out = "\n".join(blocks[:3]) if len(blocks) > 3 else msg

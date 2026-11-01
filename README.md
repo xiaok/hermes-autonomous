@@ -113,8 +113,10 @@ The full teardown and the research numbers (the best models score ~66% F1 on "sh
 ## Your data
 
 - Only sessions that belong to **your** user id are read, and by default only your DM with Hermes:
-  your messages there and Hermes' replies. Group chats and threads (Discord/threads, Slack threads,
-  i.e. any session Hermes records as `chat_type='group'` or `'thread'`) are off unless you run
+  your messages there and Hermes' replies. Group chats, threads, forum topics and channels
+  (Discord/Slack threads, Telegram forum-group topics — i.e. any session Hermes records as
+  `chat_type='group'`, `'thread'`, `'forum'` or `'channel'`; a Telegram private-chat topic stays
+  `'dm'`) are off unless you run
   `followups.py setup --include-groups` — and once on, *everything* in those sessions is read,
   including what other members wrote there.
 - State lives in `~/.hermes/plugin-data/hermes-autonomous/` (SQLite + settings, mode 0600), never in
@@ -124,8 +126,8 @@ The full teardown and the research numbers (the best models score ~66% F1 on "sh
 ## What it touches (disclosure)
 
 - **Reads** the Hermes session database `~/.hermes/state.db` — read-only, only sessions owned by your
-  user id: user and assistant turns in your DM; group and thread sessions (all members' messages)
-  only with `include_groups`. No other files are read.
+  user id: user and assistant turns in your DM; group, thread, forum and channel sessions (all
+  members' messages) only with `include_groups`. No other files are read.
 - **Writes** only its own data directory `~/.hermes/plugin-data/hermes-autonomous/`
   (SQLite board + `settings.json`, mode 0600).
 - **Network**: the plugin code makes no requests. During a review your agent may look things up

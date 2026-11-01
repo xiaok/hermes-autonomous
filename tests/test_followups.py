@@ -451,14 +451,50 @@ class IncludeGroups(Home):
         self.fu("setup", "--no-include-groups")
         self.assertEqual(self.texts(), ["in my dm"])
 
-    def add_thread_message(self, text: str = "in a thread") -> None:
-        """A Discord thread is its own session row: chat_type='thread'."""
+    def add_session_message(self, source: str, chat_type: str, text: str, ts: float) -> None:
+        """A thread / forum topic / channel is its own session row with its own chat_type."""
+        sid = f"s-{chat_type}"
         c = sqlite3.connect(self.home / "state.db")
-        c.execute("INSERT INTO sessions VALUES('s-thread','discord','thread','t',?)", (OWNER,))
+        c.execute("INSERT INTO sessions VALUES(?,?,?,'t',?)", (sid, source, chat_type, OWNER))
         c.execute("INSERT INTO messages(session_id,timestamp,role,content)"
-                  " VALUES('s-thread',?,'user',?)", (self.wm + 3, text))
+                  " VALUES(?,?,'user',?)", (sid, ts, text))
         c.commit()
         c.close()
+
+    def add_thread_message(self, text: str = "in a thread") -> None:
+        """A Discord thread is its own session row: chat_type='thread'."""
+        self.add_session_message("discord", "thread", text, self.wm + 3)
+
+    def add_forum_and_channel_messages(self) -> None:
+        """Telegram forum-group topics are chat_type='forum'; channels are 'channel'."""
+        self.add_session_message("telegram", "forum", "in a forum topic", self.wm + 4)
+        self.add_session_message("discord", "channel", "in a channel", self.wm + 5)
+
+    def test_default_skips_forum_and_channel(self):
+        self.add_forum_and_channel_messages()
+        self.assertEqual(self.texts(), ["in my dm"])
+
+    def test_include_groups_reads_forum_and_channel(self):
+        """Forum topics and channels are multi-member too, so include_groups covers them."""
+        self.add_forum_and_channel_messages()
+        self.fu("setup", "--include-groups")
+        self.assertEqual(self.texts(), ["in my dm", "a group member said this",
+                                        "in a forum topic", "in a channel"])
+
+    def test_wake_counts_forum_messages_when_enabled(self):
+        """The wake gate must count exactly what digest reads — forum topics included."""
+        c = self.db()
+        c.execute("UPDATE kv SET v=? WHERE k='last_capture'", (str(time.time() - 3 * 3600),))
+        c.commit()
+        sc = sqlite3.connect(self.home / "state.db")
+        sc.execute("DELETE FROM messages WHERE content IN ('in my dm','a group member said this')")
+        sc.commit()
+        sc.close()
+        self.add_session_message("telegram", "forum", "in a forum topic", self.wm + 4)
+        self.assertEqual(self.wake(), "quiet")  # forum topics are off by default
+        self.fu("setup", "--include-groups")
+        woke = self.wake()
+        self.assertIn('"capture"', woke, f"a forum message did not wake the gate: {woke!r}")
 
     def test_include_groups_reads_threads_too(self):
         """Threads are group-like (several members can post), so include_groups covers them."""

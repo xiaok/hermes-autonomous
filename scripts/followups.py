@@ -92,9 +92,11 @@ def chat_types() -> tuple[str, ...]:
     messages land in the owner's session too, so reading groups is opt-in. Discord
     (and Slack) threads are group-like — several members can post in one thread, and
     Hermes records them as chat_type='thread' — so they follow the same switch
-    instead of adding a third flag that would only be forgotten."""
+    instead of adding a third flag that would only be forgotten. Same for 'forum'
+    (Telegram forum-group topics) and 'channel': every non-DM chat_type Hermes
+    records is multi-member. (A Telegram private-chat topic stays 'dm'.)"""
     if (load_settings() or {}).get("include_groups") is True:
-        return ("dm", "group", "thread")
+        return ("dm", "group", "thread", "forum", "channel")
     return ("dm",)
 
 
@@ -760,7 +762,8 @@ def main() -> int:
     su.add_argument("--dm-target", default="")
     su.add_argument("--timezone", default="", help="IANA name, e.g. Asia/Shanghai")
     su.add_argument("--include-groups", action=argparse.BooleanOptionalAction, default=None,
-                    help="also read group sessions (other members' messages included); default off")
+                    help="also read group/thread/forum/channel sessions (other members' "
+                         "messages included); default off")
     su.set_defaults(fn=cmd_setup)
 
     dmt = sub.add_parser("dm-target")

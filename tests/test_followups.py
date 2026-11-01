@@ -451,6 +451,37 @@ class IncludeGroups(Home):
         self.fu("setup", "--no-include-groups")
         self.assertEqual(self.texts(), ["in my dm"])
 
+    def add_thread_message(self, text: str = "in a thread") -> None:
+        """A Discord thread is its own session row: chat_type='thread'."""
+        c = sqlite3.connect(self.home / "state.db")
+        c.execute("INSERT INTO sessions VALUES('s-thread','discord','thread','t',?)", (OWNER,))
+        c.execute("INSERT INTO messages(session_id,timestamp,role,content)"
+                  " VALUES('s-thread',?,'user',?)", (self.wm + 3, text))
+        c.commit()
+        c.close()
+
+    def test_include_groups_reads_threads_too(self):
+        """Threads are group-like (several members can post), so include_groups covers them."""
+        self.add_thread_message()
+        self.assertEqual(self.texts(), ["in my dm"])
+        self.fu("setup", "--include-groups")
+        self.assertEqual(self.texts(), ["in my dm", "a group member said this", "in a thread"])
+
+    def test_wake_counts_thread_messages_when_enabled(self):
+        """The wake gate must count exactly what digest reads — threads included."""
+        c = self.db()
+        c.execute("UPDATE kv SET v=? WHERE k='last_capture'", (str(time.time() - 3 * 3600),))
+        c.commit()
+        sc = sqlite3.connect(self.home / "state.db")
+        sc.execute("DELETE FROM messages WHERE content IN ('in my dm','a group member said this')")
+        sc.commit()
+        sc.close()
+        self.add_thread_message()
+        self.assertEqual(self.wake(), "quiet")  # groups and threads are off by default
+        self.fu("setup", "--include-groups")
+        woke = self.wake()
+        self.assertIn('"capture"', woke, f"a thread message did not wake the gate: {woke!r}")
+
     def test_wake_counts_only_what_digest_reads(self):
         c = self.db()
         c.execute("UPDATE kv SET v=? WHERE k='last_capture'", (str(time.time() - 3 * 3600),))

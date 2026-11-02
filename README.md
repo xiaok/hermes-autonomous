@@ -37,8 +37,17 @@ python3 $PLUGIN/scripts/followups.py setup --owner-id <id> --dm-target telegram:
 cp $PLUGIN/cron/*.py ~/.hermes/scripts/
 hermes cron create "*/15 * * * *" --name "proactive follow-ups" \
   --monitor-script followup-wake.py --script followup-digest.py \
-  --prompt "Read $PLUGIN/prompts/review.md and follow it" --deliver origin
+  --prompt "Read $PLUGIN/prompts/review.md and follow it" \
+  --deliver local --failure-deliver origin
 ```
+
+- **`--monitor-script` is required.** It is the wake gate; leave it out and the agent runs
+  unconditionally every 15 minutes.
+- **`--deliver local`** keeps normal runs from posting anything to your chat — you only hear from the
+  job if it fails (`--failure-deliver origin`). The follow-ups themselves already reach you as DMs
+  via `hermes send`.
+- Optional debug switch: `followups.py setup --dev-log` makes each run reply with a short developer
+  log (off by default; `--no-dev-log` turns it back off).
 
 Don't know your Telegram id? Message [@userinfobot](https://t.me/userinfobot), or ask Hermes — it can
 read the id of the conversation it is in.

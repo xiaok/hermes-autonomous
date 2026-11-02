@@ -49,6 +49,8 @@ def local_tz():
 
 MAX_MSG_CHARS = 1200
 MAX_MESSAGES = 250
+MAX_SENT_TEXT = 1200        # stored
+MAX_SENT_TEXT_DIGEST = 300  # shown to the review agent
 
 # Who owns this install lives in settings.json (or AUTONOMY_OWNER_ID), never in
 # the repo: only the owner's own sessions are read (DM only unless include_groups).
@@ -100,6 +102,12 @@ def chat_types() -> tuple[str, ...]:
     return ("dm",)
 
 
+def dev_log() -> bool:
+    """Developer log as the run's final reply: opt-in (setup --dev-log). The cron job
+    delivers that reply to a chat, so on by default it spams real users every 15 min."""
+    return (load_settings() or {}).get("dev_log") is True
+
+
 def dm_target() -> str:
     return setting("dm_target", "AUTONOMY_DM_TARGET")
 
@@ -148,7 +156,12 @@ def connect() -> sqlite3.Connection:
     # Migration: older DBs lack the delivery/outcome columns. `hermes send` output is
     # not written back into state.db, so this table is the only receipt we have.
     cols = {r["name"] for r in conn.execute("PRAGMA table_info(followups)")}
-    for name, decl in (("sent_at", "REAL"), ("sent_msg_id", "TEXT"), ("outcome", "TEXT")):
+    # sends / sent_text: how many times it actually went out and what was said last,
+    # so the review can tell "sent once already" from "never sent". `checks` counts
+    # silent looks and sends alike and cannot answer that.
+    for name, decl in (("sent_at", "REAL"), ("sent_msg_id", "TEXT"), ("outcome", "TEXT"),
+                       ("sends", "INTEGER NOT NULL DEFAULT 0"),
+                       ("sent_text", "TEXT NOT NULL DEFAULT ''")):
         if name not in cols:
             conn.execute(f"ALTER TABLE followups ADD COLUMN {name} {decl}")
     return conn
@@ -278,6 +291,7 @@ def cmd_digest(args) -> int:
             "checks": r["checks"], "last_checked": _iso(r["last_checked"]),
             "status": r["status"],
             "sent_at": _iso(r["sent_at"]), "sent_msg_id": r["sent_msg_id"],
+            "sends": r["sends"], "sent_text": (r["sent_text"] or "")[:MAX_SENT_TEXT_DIGEST],
             "outcome": r["outcome"],
         }
         for r in conn.execute("SELECT * FROM followups WHERE status='active' ORDER BY revisit_at").fetchall()
@@ -296,6 +310,7 @@ def cmd_digest(args) -> int:
         "mode": "review" if any(f["due"] for f in active) else "capture",
         "night": _is_night(),
         "muted": muted_whys(conn, now),
+        "dev_log": dev_log(),
         "instructions": "见 prompts/review.md：产出一份 apply JSON（watermark 用 next_watermark），"
                         "需要私聊就先 hermes send，再 followups.py apply 一次写回。",
     }
@@ -378,7 +393,10 @@ def cmd_setup(args) -> int:
         cur["timezone"] = str(args.timezone)
     if args.include_groups is not None:
         cur["include_groups"] = args.include_groups
+    if args.dev_log is not None:
+        cur["dev_log"] = args.dev_log
     cur.setdefault("include_groups", False)
+    cur.setdefault("dev_log", False)
     settings_path().write_text(json.dumps(cur, indent=2), encoding="utf-8")
     saved = settings_path()
     os.chmod(saved, 0o600)
@@ -423,8 +441,8 @@ def cmd_sent(args) -> int:
     now = time.time()
     cur = conn.execute(
         "UPDATE followups SET sent_at=?, sent_msg_id=?, checks=checks+1, "
-        "revisit_at=? WHERE id=?",
-        (now, args.msg_id.strip(), now + 86400, args.id),
+        "sends=sends+1, sent_text=?, revisit_at=? WHERE id=?",
+        (now, args.msg_id.strip(), (args.text or "")[:MAX_SENT_TEXT], now + 86400, args.id),
     )
     if cur.rowcount == 0:
         print(json.dumps({"ok": False, "error": f"no followup {args.id}"}))
@@ -549,7 +567,7 @@ def _apply(conn, doc: dict) -> dict:
     sent = doc.get("sent")
     sent_ids: list[int] = []
     if sent is not None:
-        _obj(sent, "sent", ("id", "ids", "msg_id"))
+        _obj(sent, "sent", ("id", "ids", "msg_id", "text"))
         if ("id" in sent) == ("ids" in sent):
             raise ApplyError("sent: give exactly one of id / ids")
         raw_ids = sent["ids"] if "ids" in sent else [sent["id"]]
@@ -560,6 +578,12 @@ def _apply(conn, doc: dict) -> dict:
         msg_id = str(sent.get("msg_id") or "").strip()
         if not msg_id:
             raise ApplyError("sent.msg_id: required — the send failed, do not mark it sent")
+        sent_text = sent.get("text")
+        if sent_text is None:
+            sent_text = ""
+        if not isinstance(sent_text, str):
+            raise ApplyError("sent.text: must be a string (the message as sent)")
+        sent_text = sent_text[:MAX_SENT_TEXT]
 
     seen: set[int] = set()
     for i, d in enumerate(_list(doc, "decisions")):
@@ -591,7 +615,8 @@ def _apply(conn, doc: dict) -> dict:
 
     for fid in sent_ids:
         conn.execute("UPDATE followups SET sent_at=?, sent_msg_id=?, checks=checks+1, "
-                     "revisit_at=? WHERE id=?", (now, msg_id, now + 86400, fid))
+                     "sends=sends+1, sent_text=?, revisit_at=? WHERE id=?",
+                     (now, msg_id, sent_text, now + 86400, fid))
         res["sent"].append(fid)
     if sent_ids:
         _set_kv(conn, "last_send", now)
@@ -749,6 +774,7 @@ def main() -> int:
     se = sub.add_parser("sent")
     se.add_argument("id", type=int)
     se.add_argument("--msg-id", default="", help="message_id from `hermes send --json`")
+    se.add_argument("--text", default="", help="the message body as sent")
     se.set_defaults(fn=cmd_sent)
 
     oc = sub.add_parser("outcome")
@@ -764,6 +790,9 @@ def main() -> int:
     su.add_argument("--include-groups", action=argparse.BooleanOptionalAction, default=None,
                     help="also read group/thread/forum/channel sessions (other members' "
                          "messages included); default off")
+    su.add_argument("--dev-log", action=argparse.BooleanOptionalAction, default=None,
+                    help="write a developer log as each run's final reply (internal "
+                         "testing); default off = final reply is [SILENT]")
     su.set_defaults(fn=cmd_setup)
 
     dmt = sub.add_parser("dm-target")

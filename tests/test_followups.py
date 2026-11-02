@@ -139,7 +139,7 @@ class FreshInstall(Home):
 
         d = json.loads(self.fu("digest").stdout)
         for k in ("now", "watermark", "next_watermark", "messages", "followups",
-                  "due_count", "mode", "night", "muted"):
+                  "due_count", "mode", "night", "muted", "dev_log"):
             self.assertIn(k, d)
         self.assertEqual(d["messages"], [])
         self.assertEqual(d["mode"], "capture")
@@ -423,6 +423,48 @@ class WakeMuted(Home):
         self.add("care-due", "care")
         self.past("care", "annoyed")
         self.assertEqual(self.wake(), "quiet")
+
+
+class DevLog(Home):
+    """The run's final reply is delivered to a chat; the developer log in it is opt-in."""
+
+    def settings_file(self) -> Path:
+        return self.home / "plugin-data" / "hermes-autonomous" / "settings.json"
+
+    def digest_dev_log(self):
+        return json.loads(self.fu("digest").stdout)["dev_log"]
+
+    def test_default_off(self):
+        self.setup_owner()
+        self.assertIs(json.loads(self.settings_file().read_text())["dev_log"], False)
+        self.assertIs(self.digest_dev_log(), False)
+
+    def test_setup_toggles(self):
+        self.setup_owner()
+        self.fu("setup", "--dev-log")
+        self.assertIs(json.loads(self.settings_file().read_text())["dev_log"], True)
+        self.assertIs(self.digest_dev_log(), True)
+        # Re-running setup without the flag keeps it.
+        self.fu("setup", "--timezone", self.tz)
+        self.assertIs(self.digest_dev_log(), True)
+        self.fu("setup", "--no-dev-log")
+        self.assertIs(self.digest_dev_log(), False)
+
+    def test_old_settings_without_key_is_off(self):
+        self.setup_owner()
+        s = json.loads(self.settings_file().read_text())
+        del s["dev_log"]
+        self.settings_file().write_text(json.dumps(s))
+        self.assertIs(self.digest_dev_log(), False)
+
+    def test_readme_cron_is_wake_gated_and_local(self):
+        for name in ("README.md", "README.zh-CN.md"):
+            with self.subTest(name=name):
+                text = (ROOT / name).read_text(encoding="utf-8")
+                cmd = text.split("hermes cron create", 1)[1].split("```", 1)[0]
+                self.assertIn("--monitor-script followup-wake.py", cmd)
+                self.assertIn("--deliver local --failure-deliver origin", cmd)
+                self.assertNotIn("--deliver origin", cmd)
 
 
 class IncludeGroups(Home):
@@ -716,6 +758,10 @@ class PromptContract(Home):
         self.assertIsNotNone(c.execute(
             "SELECT 1 FROM followups WHERE key=?", (doc["new_followups"][0]["key"],)).fetchone())
         self.assertEqual(self.row(doc["sent"]["id"])["sent_msg_id"], doc["sent"]["msg_id"])
+        # The example teaches the agent to pass the sent text back.
+        self.assertTrue(doc["sent"].get("text"), doc["sent"])
+        self.assertEqual(self.row(doc["sent"]["id"])["sent_text"], doc["sent"]["text"])
+        self.assertEqual(self.row(doc["sent"]["id"])["sends"], 1)
         got = c.execute("SELECT last_ts FROM watermark WHERE surface='messages'").fetchone()[0]
         self.assertEqual(got, doc["watermark"])
 
@@ -727,6 +773,7 @@ class PromptContract(Home):
         for s in snippets:
             with self.subTest(s=s):
                 doc = json.loads("{" + s + ', "watermark": 1.0}')
+                self.assertIn("text", doc["sent"])
                 self.assertTrue(self.apply(doc)["ok"])
 
     def test_outcome_variants_apply(self):
@@ -738,11 +785,145 @@ class PromptContract(Home):
             with self.subTest(o=o):
                 self.assertTrue(self.apply({"outcomes": [o], "watermark": 1.0})["ok"])
 
+    def test_resend_rules_live_in_due_section(self):
+        # The no-resend rules must sit in §3 (handling due items), where they are read
+        # before the scoring, not somewhere the agent reaches after deciding.
+        s3 = self.text.split("## 3.", 1)[1].split("## 4.", 1)[0]
+        for needle in ("sends >= 1", "事件已过", "`why=care` 且 `sends >= 2`", "sent_text"):
+            self.assertIn(needle, s3)
+
+    def test_final_reply_silent_unless_dev_log(self):
+        # The final reply is delivered to the user's chat: default must be [SILENT],
+        # the developer log only behind dev_log=true.
+        s6 = self.text.split("## 6.", 1)[1].split("## 7.", 1)[0]
+        self.assertIn("`dev_log` 不为 true（默认）→ 最终回复必须是 `[SILENT]`", s6)
+        self.assertIn("只有 `dev_log=true`", s6)
+
     def test_empty_parts_as_documented(self):
         # §5: "没有的部分给空列表或 null；watermark 必须有。"
         doc = {"new_followups": [], "outcomes": None, "close": [], "decisions": [],
                "sent": None, "watermark": 1.0}
         self.assertTrue(self.apply(doc)["ok"])
+
+
+class SendCount(Home):
+    """sends / sent_text: how often an item really went out and what it said last.
+    The review needs both to tell "already told him" from "never told him"."""
+
+    def setUp(self):
+        super().setUp()
+        self.setup_owner()
+
+    def digest_item(self, fid: int) -> dict:
+        items = json.loads(self.fu("digest").stdout)["followups"]
+        return next(f for f in items if f["id"] == fid)
+
+    def test_new_item_defaults(self):
+        fid = self.add("x")
+        r = self.row(fid)
+        self.assertEqual((r["sends"], r["sent_text"]), (0, ""))
+
+    def test_only_real_sends_count(self):
+        fid = self.add("rain")
+        self.apply({"decisions": [{"id": fid, "action": "silent", "reason": "r"}],
+                    "watermark": 1.0})
+        self.fu("checked", str(fid))
+        r = self.row(fid)
+        self.assertEqual((r["checks"], r["sends"]), (2, 0))  # checks still counts looks
+
+        self.apply({"sent": {"id": fid, "msg_id": "1", "text": "明天下雨"}, "watermark": 1.0})
+        self.fu("sent", str(fid), "--msg-id", "2", "--text", "今天还在下")
+        r = self.row(fid)
+        self.assertEqual((r["checks"], r["sends"]), (4, 2))
+        self.assertEqual(r["sent_text"], "今天还在下")  # the last one wins
+
+        self.apply({"decisions": [{"id": fid, "action": "silent", "reason": "r"}],
+                    "watermark": 1.0})
+        self.assertEqual(self.row(fid)["sends"], 2)
+
+    def test_sent_ids_record_text_on_each(self):
+        a, b = self.add("a"), self.add("b")
+        self.apply({"sent": {"ids": [a, b], "msg_id": "7", "text": "two in one"},
+                    "watermark": 1.0})
+        for fid in (a, b):
+            r = self.row(fid)
+            self.assertEqual((r["sends"], r["sent_text"]), (1, "two in one"))
+
+    def test_sent_without_text_still_counts(self):
+        fid = self.add("x")
+        self.apply({"sent": {"id": fid, "msg_id": "1"}, "watermark": 1.0})
+        r = self.row(fid)
+        self.assertEqual((r["sends"], r["sent_text"]), (1, ""))
+
+    def test_sent_text_not_a_string_rolls_back(self):
+        fid = self.add("x")
+        before = self.snapshot()
+        out = self.apply({"sent": {"id": fid, "msg_id": "1", "text": 5}, "watermark": 1.0},
+                         ok=False)
+        self.assertIn("sent.text", out["error"])
+        self.assertEqual(self.snapshot(), before)
+
+    def test_long_text_is_truncated_in_db_and_digest(self):
+        fid = self.add("x")
+        long = "长" * 5000
+        self.apply({"sent": {"id": fid, "msg_id": "1", "text": long}, "watermark": 1.0})
+        self.assertEqual(self.row(fid)["sent_text"], "长" * 1200)
+        item = self.digest_item(fid)
+        self.assertEqual(item["sent_text"], "长" * 300)
+        self.fu("sent", str(fid), "--msg-id", "2", "--text", "x" * 5000)
+        self.assertEqual(len(self.row(fid)["sent_text"]), 1200)
+
+    def test_digest_carries_sends_and_sent_text(self):
+        fid = self.add("x")
+        item = self.digest_item(fid)
+        self.assertEqual((item["sends"], item["sent_text"]), (0, ""))
+        self.apply({"sent": {"id": fid, "msg_id": "1", "text": "好点没？"}, "watermark": 1.0})
+        item = self.digest_item(fid)
+        self.assertEqual((item["sends"], item["sent_text"]), (1, "好点没？"))
+
+    def test_upsert_keeps_sends_and_text(self):
+        fid = self.add("trip")
+        self.apply({"sent": {"id": fid, "msg_id": "1", "text": "t"}, "watermark": 1.0})
+        self.apply({"new_followups": [{"key": "trip", "why": "care", "kind": "k",
+                                       "subject": "v2", "revisit_at": "+1d"}],
+                    "watermark": 1.0})
+        r = self.row(fid)
+        self.assertEqual((r["sends"], r["sent_text"]), (1, "t"))
+
+
+class OldDbMigration(Home):
+    """A followups.db from before sends/sent_text (and before sent_at/outcome)."""
+
+    def test_old_db_gains_columns_with_defaults(self):
+        path = self.home / "plugin-data" / "hermes-autonomous"
+        path.mkdir(parents=True)
+        c = sqlite3.connect(path / "followups.db")
+        c.executescript(
+            "CREATE TABLE followups (id INTEGER PRIMARY KEY AUTOINCREMENT, key TEXT UNIQUE,"
+            " kind TEXT, why TEXT, subject TEXT, quote TEXT, hint TEXT, revisit_at REAL,"
+            " status TEXT DEFAULT 'active', checks INTEGER DEFAULT 0, last_checked REAL,"
+            " note TEXT, created_at REAL);")
+        c.execute("INSERT INTO followups(key,kind,why,subject,revisit_at,checks)"
+                  " VALUES('old','k','care','s',?,3)", (time.time() + 3600,))
+        c.commit()
+        c.close()
+
+        self.setup_owner()  # opens the DB: migration runs here
+        cols = {r["name"]: r for r in self.db().execute("PRAGMA table_info(followups)")}
+        for name in ("sent_at", "sent_msg_id", "outcome", "sends", "sent_text"):
+            self.assertIn(name, cols)
+        self.assertEqual(cols["sends"]["notnull"], 1)
+        self.assertEqual(cols["sent_text"]["notnull"], 1)
+
+        r = self.db().execute("SELECT * FROM followups WHERE key='old'").fetchone()
+        self.assertEqual((r["sends"], r["sent_text"], r["checks"]), (0, "", 3))
+        item = json.loads(self.fu("digest").stdout)["followups"][0]
+        self.assertEqual((item["sends"], item["sent_text"]), (0, ""))
+
+        # Opening again is a no-op, and a send now counts from zero.
+        self.apply({"sent": {"id": r["id"], "msg_id": "1", "text": "hi"}, "watermark": 1.0})
+        r = self.db().execute("SELECT * FROM followups WHERE key='old'").fetchone()
+        self.assertEqual((r["sends"], r["sent_text"], r["checks"]), (1, "hi", 4))
 
 
 class DigestTruncationAndNoise(Home):

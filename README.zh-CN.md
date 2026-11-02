@@ -31,8 +31,14 @@ python3 $PLUGIN/scripts/followups.py setup --owner-id <你的 Telegram user id> 
 cp $PLUGIN/cron/*.py ~/.hermes/scripts/
 hermes cron create "*/15 * * * *" --name "主动跟进" \
   --monitor-script followup-wake.py --script followup-digest.py \
-  --prompt "读 $PLUGIN/prompts/review.md 并执行" --deliver origin
+  --prompt "读 $PLUGIN/prompts/review.md 并执行" \
+  --deliver local --failure-deliver origin
 ```
+
+- **`--monitor-script` 是必需的。** 它是唤醒门；漏了它，就是每 15 分钟无条件跑一次 agent。
+- **`--deliver local`** 让正常 run 不往聊天里发任何东西，只有 job 失败才通知你（`--failure-deliver origin`）。
+  跟进消息本来就通过 `hermes send` 走私聊发给你。
+- 可选调试开关：`followups.py setup --dev-log` 让每次 run 回一段开发日志（默认关；`--no-dev-log` 关掉）。
 
 不知道自己的 id？找 [@userinfobot](https://t.me/userinfobot)，或者直接问 Hermes——它知道当前会话的 id。
 

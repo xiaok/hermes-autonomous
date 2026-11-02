@@ -25,6 +25,28 @@ FOLLOWUPS = ROOT / "scripts" / "followups.py"
 WAKE = ROOT / "scripts" / "wake.py"
 OWNER = "4242"
 
+# Stand-in for the `hermes` CLI: `cron list [--json]` and `cron edit` over a
+# jobs.json next to it; every call is appended to calls.jsonl.
+FAKE_HERMES = '''#!{python}
+import json, sys
+from pathlib import Path
+here = Path(__file__).resolve().parent
+args = sys.argv[1:]
+with open(here / "calls.jsonl", "a") as f:
+    f.write(json.dumps(args) + "\\n")
+jobs = json.loads((here / "jobs.json").read_text())
+if args[:2] == ["cron", "list"]:
+    print(json.dumps(jobs) if "--json" in args else "(text)")
+elif args[:2] == ["cron", "edit"]:
+    job = next(j for j in jobs if j["id"] == args[2])
+    rest = args[3:]
+    for flag, val in zip(rest[::2], rest[1::2]):
+        job[flag[2:].replace("-", "_")] = val
+    (here / "jobs.json").write_text(json.dumps(jobs))
+else:
+    sys.exit(2)
+'''
+
 
 def daytime_tz() -> str:
     """A fixed-offset zone where it is mid-day right now, so night rules never
@@ -61,8 +83,22 @@ class Home(unittest.TestCase):
                     if not k.startswith("AUTONOMY_") and k != "HERMES_HOME"}
         self.env["HERMES_HOME"] = str(self.home)
         self.tz = daytime_tz()
+        # setup runs doctor, which shells out to `hermes`: never reach the real one.
+        self.bin = self.home / "fakebin"
+        self.bin.mkdir()
+        (self.bin / "hermes").write_text(FAKE_HERMES.format(python=sys.executable))
+        (self.bin / "hermes").chmod(0o755)
+        self.set_jobs([])
+        self.env["PATH"] = f"{self.bin}{os.pathsep}{self.env.get('PATH', '')}"
 
     # -- helpers ---------------------------------------------------------------
+
+    def set_jobs(self, jobs: list[dict]):
+        (self.bin / "jobs.json").write_text(json.dumps(jobs))
+
+    def hermes_calls(self) -> list[list[str]]:
+        p = self.bin / "calls.jsonl"
+        return [json.loads(l) for l in p.read_text().splitlines()] if p.exists() else []
 
     def run_cli(self, script: Path, *args: str, stdin: str | None = None):
         return subprocess.run([sys.executable, str(script), *args], input=stdin,
@@ -987,6 +1023,120 @@ class DigestTruncationAndNoise(Home):
         self.state_db([(self.wm + 5, "user", "[CONTEXT COMPACTION] summary", OWNER)])
         self.assertEqual(self.digest()["messages"], [])
         self.assertEqual(self.wake(), "quiet")
+
+
+class Doctor(Home):
+    FIX = ["--monitor-script", "followup-wake.py", "--deliver", "local",
+           "--failure-deliver", "origin"]
+
+    def setUp(self):
+        super().setUp()
+        self.setup_owner()
+        scripts = self.home / "scripts"
+        scripts.mkdir()
+        for name in ("followup-wake.py", "followup-digest.py"):
+            (scripts / name).write_text("")
+        (self.bin / "calls.jsonl").unlink(missing_ok=True)  # forget setup's own doctor run
+
+    def job(self, **over) -> dict:
+        j = {"id": "a1b2c3", "name": "proactive follow-ups", "script": "followup-digest.py",
+             "prompt": "Read /x/prompts/review.md and follow it",
+             "monitor_script": "followup-wake.py", "deliver": "local",
+             "failure_deliver": "origin"}
+        j.update(over)
+        return {k: v for k, v in j.items() if v is not None}
+
+    def doctor(self, *args: str):
+        p = self.run_cli(FOLLOWUPS, "doctor", "--json", *args)
+        return p, json.loads(p.stdout)
+
+    def edits(self) -> list[list[str]]:
+        return [c for c in self.hermes_calls() if c[:2] == ["cron", "edit"]]
+
+    def test_healthy_job_is_ok_and_fix_does_not_edit(self):
+        self.set_jobs([self.job()])
+        p, rep = self.doctor()
+        self.assertEqual(p.returncode, 0, p.stdout)
+        self.assertTrue(rep["ok"])
+        self.assertEqual([j["id"] for j in rep["jobs"]], ["a1b2c3"])
+        p, rep = self.doctor("--fix")
+        self.assertTrue(rep["ok"])
+        self.assertEqual(self.edits(), [])
+
+    def test_old_job_warns_and_fix_edits_it_in_place(self):
+        self.set_jobs([self.job(monitor_script=None, deliver="origin", failure_deliver=None),
+                       {"id": "zzz999", "name": "unrelated", "deliver": "origin"}])
+        p, rep = self.doctor()
+        self.assertEqual(p.returncode, 1)
+        self.assertFalse(rep["ok"])
+        warns = {c["name"] for c in rep["checks"] if c["status"] == "WARN"}
+        self.assertEqual(warns, {"job a1b2c3: monitor_script", "job a1b2c3: deliver"})
+        self.assertEqual(self.edits(), [], "doctor without --fix must not edit")
+
+        p, rep = self.doctor("--fix")
+        self.assertTrue(rep["ok"], rep)
+        self.assertEqual(self.edits(), [["cron", "edit", "a1b2c3", *self.FIX]])
+        self.assertTrue(all(c["fixed"] for c in rep["checks"] if c["status"] == "WARN"))
+        # Idempotent: the job is now right, a second --fix leaves it alone.
+        _, rep = self.doctor("--fix")
+        self.assertTrue(rep["ok"])
+        self.assertEqual(len(self.edits()), 1)
+
+    def test_missing_wake_script_is_not_wired_in(self):
+        (self.home / "scripts" / "followup-wake.py").unlink()
+        self.set_jobs([self.job(monitor_script=None)])
+        _, rep = self.doctor("--fix")
+        self.assertFalse(rep["ok"])
+        self.assertEqual(self.edits(), [])
+        self.assertTrue(any("cron edit a1b2c3" in c for c in rep["suggested_commands"]))
+
+    def test_missing_script_file_fails(self):
+        (self.home / "scripts" / "followup-digest.py").unlink()
+        self.set_jobs([self.job()])
+        _, rep = self.doctor()
+        fails = [c["name"] for c in rep["checks"] if c["status"] == "FAIL"]
+        self.assertEqual(fails, ["job a1b2c3: script file"])
+
+    def test_matches_by_prompt_or_chinese_name(self):
+        self.set_jobs([self.job(id="j1", name="x", script=None),
+                       self.job(id="j2", name="主动跟进", prompt="", script=None)])
+        _, rep = self.doctor()
+        self.assertEqual([j["id"] for j in rep["jobs"]], ["j1", "j2"])
+        self.assertIn("WARN", [c["status"] for c in rep["checks"] if c["name"] == "cron"])
+
+    def test_no_job_prints_create_command_and_never_edits(self):
+        p = self.run_cli(FOLLOWUPS, "doctor", "--fix")
+        self.assertEqual(p.returncode, 1)
+        self.assertIn("hermes cron create", p.stdout)
+        for flag in ("--monitor-script followup-wake.py", "--script followup-digest.py",
+                     "--deliver local", "--failure-deliver origin"):
+            self.assertIn(flag, p.stdout)
+        self.assertEqual(self.edits(), [])
+
+    def test_json_output_is_stable(self):
+        p = self.run_cli(FOLLOWUPS, "doctor", "--json")
+        rep = json.loads(p.stdout)
+        self.assertEqual(set(rep), {"ok", "checks", "jobs", "suggested_commands"})
+        for c in rep["checks"]:
+            self.assertEqual(set(c), {"name", "status", "detail", "fixed"})
+            self.assertIn(c["status"], ("OK", "WARN", "FAIL"))
+
+    def test_missing_settings_fail_but_defaults_only_inform(self):
+        (self.home / "plugin-data" / "hermes-autonomous" / "settings.json").write_text("{}")
+        self.set_jobs([self.job()])
+        _, rep = self.doctor()
+        status = {c["name"]: c["status"] for c in rep["checks"]}
+        self.assertEqual(status["settings.owner_id"], "FAIL")
+        self.assertEqual(status["settings.dm_target"], "FAIL")
+        self.assertEqual(status["settings.timezone"], "OK")
+        self.assertFalse(rep["ok"])
+
+    def test_setup_prints_warn_summary_but_succeeds(self):
+        p = self.fu("setup", "--dev-log")  # no cron job exists: doctor warns
+        json.loads(p.stdout)  # stdout stays one JSON document
+        self.assertIn("[WARN] cron", p.stderr)
+        self.assertLessEqual(len([l for l in p.stderr.splitlines() if l.strip().startswith("[")]), 5)
+        self.assertEqual(self.edits(), [])
 
 
 if __name__ == "__main__":

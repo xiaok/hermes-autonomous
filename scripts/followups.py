@@ -18,6 +18,7 @@ watermark [--set ISO]  read or set the message cursor
 apply [--file F]       write back a whole review run (JSON, stdin by default) in one transaction
 why                    muted categories + decisions of the last 5 runs (read-only)
 log                    one line per recent review run (read-only)
+doctor [--fix] [--json]  check settings + this plugin's cron job; --fix edits the job in place
 """
 
 from __future__ import annotations
@@ -25,7 +26,11 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
+import shlex
+import shutil
 import sqlite3
+import subprocess
 import sys
 import time
 from datetime import datetime, timedelta, timezone
@@ -402,6 +407,18 @@ def cmd_setup(args) -> int:
     os.chmod(saved, 0o600)
     connect().close()  # create the DB + schema so digest/wake work right after setup
     print(json.dumps({"ok": True, "path": str(saved), "settings": cur}, ensure_ascii=False))
+    # Read-only health check. stderr keeps stdout a single JSON document; a WARN
+    # here is advice, never a setup failure.
+    try:
+        bad = [c for c in _doctor(fix=False)["checks"] if c["status"] != "OK"]
+    except Exception as e:  # noqa: BLE001
+        bad = [{"status": "WARN", "name": "doctor", "detail": f"{type(e).__name__}: {e}"}]
+    if bad:
+        print("doctor:", file=sys.stderr)
+        for c in bad[:5]:
+            print(f"  [{c['status']}] {c['name']}: {c['detail']}", file=sys.stderr)
+        print("  details: followups.py doctor   (fix the cron job: followups.py doctor --fix)",
+              file=sys.stderr)
     return 0
 
 
@@ -740,6 +757,254 @@ def cmd_log(_args) -> int:
     return 0
 
 
+# -- doctor ------------------------------------------------------------------
+# Upgrades have no post-update hook, so old installs keep whatever cron job the
+# README of the day told them to create. doctor finds that job and, with --fix,
+# edits it in place. It never creates, removes or recreates a job.
+
+PLUGIN_DIR = Path(__file__).resolve().parent.parent
+WAKE_SCRIPT = "followup-wake.py"
+DIGEST_SCRIPT = "followup-digest.py"
+JOB_NAMES = ("proactive follow-ups", "主动跟进")
+FIX_ARGS = ("--monitor-script", WAKE_SCRIPT, "--deliver", "local", "--failure-deliver", "origin")
+_ANSI = re.compile(r"\x1b\[[0-9;]*m")
+
+
+def _hermes_home() -> Path:
+    return Path(os.environ.get("HERMES_HOME") or (Path.home() / ".hermes"))
+
+
+def _hermes(*args: str, timeout: float = 30) -> tuple[int, str, str]:
+    """(returncode, stdout, stderr); 127 = no hermes on PATH, 124 = timed out."""
+    exe = shutil.which("hermes")
+    if not exe:
+        return 127, "", "hermes not found on PATH"
+    try:
+        p = subprocess.run([exe, *args], capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return 124, "", f"hermes {' '.join(args)} timed out"
+    except OSError as e:
+        return 126, "", f"{type(e).__name__}: {e}"
+    return p.returncode, p.stdout or "", p.stderr or ""
+
+
+def _last_line(*texts: str) -> str:
+    for t in texts:
+        lines = [l for l in (t or "").strip().splitlines() if l.strip()]
+        if lines:
+            return lines[-1].strip()
+    return ""
+
+
+def _parse_cron_text(out: str) -> list[dict]:
+    """Best effort over the human `hermes cron list` output: a job header line
+    `<id> [state]` followed by indented `Key: value` lines."""
+    jobs: list[dict] = []
+    for raw in _ANSI.sub("", out).splitlines():
+        head = re.match(r"^\s*([A-Za-z0-9_.-]{4,})\s+\[[^\]]*\]", raw)
+        if head:
+            jobs.append({"id": head.group(1)})
+            continue
+        kv = re.match(r"^\s+([A-Za-z][A-Za-z _-]*?)\s*:\s+(.*\S)\s*$", raw)
+        if kv and jobs:
+            jobs[-1][re.sub(r"[\s-]+", "_", kv.group(1).strip().lower())] = kv.group(2)
+    return jobs
+
+
+def _list_cron_jobs() -> tuple[list[dict] | None, str]:
+    """(jobs, error). Reads Hermes' own job store first: it is the source the CLI
+    renders, it carries the real field names, and it includes disabled jobs. The
+    CLI is only a fallback for stores we cannot read."""
+    store = _hermes_home() / "cron" / "jobs.json"
+    try:
+        doc = json.loads(store.read_text(encoding="utf-8"))
+        jobs = doc.get("jobs") if isinstance(doc, dict) else doc
+        if isinstance(jobs, dict):
+            jobs = list(jobs.values())
+        if isinstance(jobs, list):
+            return [j for j in jobs if isinstance(j, dict)], ""
+    except (OSError, ValueError):
+        pass
+    rc, out, err = _hermes("cron", "list", "--json")
+    if rc == 127:
+        return None, err
+    if rc == 0:
+        try:
+            doc = json.loads(out)
+        except ValueError:
+            doc = None
+        jobs = doc.get("jobs") if isinstance(doc, dict) else doc
+        if isinstance(jobs, list):
+            return [j for j in jobs if isinstance(j, dict)], ""
+    rc, out, err = _hermes("cron", "list")
+    if rc != 0:
+        return None, _last_line(err, out) or f"hermes cron list exited {rc}"
+    return _parse_cron_text(out), ""
+
+
+def _norm_job(j: dict) -> dict:
+    def g(*keys):
+        for k in keys:
+            v = j.get(k)
+            if v not in (None, "", [], {}):
+                return v
+        return None
+
+    def s(v) -> str:
+        if isinstance(v, list):
+            return ",".join(str(x) for x in v)
+        return "" if v is None else str(v)
+
+    return {
+        "id": s(g("id", "job_id")),
+        "name": s(g("name")),
+        "prompt": s(g("prompt")),
+        "script": s(g("script")),
+        "monitor_script": s(g("monitor_script", "monitor", "monitorScript")),
+        "deliver": s(g("deliver", "delivery")),
+        "failure_deliver": s(g("failure_deliver", "failureDeliver")),
+    }
+
+
+def _is_ours(job: dict) -> bool:
+    name = job["name"].lower()
+    return ("prompts/review.md" in job["prompt"]
+            or Path(job["script"]).name == DIGEST_SCRIPT
+            or any(n in name for n in JOB_NAMES))
+
+
+def _cmd(argv) -> str:
+    return " ".join(shlex.quote(a) for a in argv)
+
+
+def _create_commands() -> list[str]:
+    scripts = _hermes_home() / "scripts"
+    return [
+        f"mkdir -p {shlex.quote(str(scripts))} && cp {shlex.quote(str(PLUGIN_DIR / 'cron'))}/*.py "
+        f"{shlex.quote(str(scripts))}/",
+        _cmd(["hermes", "cron", "create", "*/15 * * * *", "--name", JOB_NAMES[0],
+              "--monitor-script", WAKE_SCRIPT, "--script", DIGEST_SCRIPT,
+              "--prompt", f"Read {PLUGIN_DIR / 'prompts' / 'review.md'} and follow it",
+              "--deliver", "local", "--failure-deliver", "origin"]),
+    ]
+
+
+def _doctor(fix: bool) -> dict:
+    checks: list[dict] = []
+    suggest: list[str] = []
+
+    def check(name: str, status: str, detail: str) -> dict:
+        c = {"name": name, "status": status, "detail": detail, "fixed": False}
+        checks.append(c)
+        return c
+
+    # a. settings
+    cur = load_settings()
+    for key, env in (("owner_id", "AUTONOMY_OWNER_ID"), ("dm_target", "AUTONOMY_DM_TARGET")):
+        if os.environ.get(env) or cur.get(key):
+            check(f"settings.{key}", "OK", "set" + (f" (from {env})" if os.environ.get(env) else ""))
+        else:
+            check(f"settings.{key}", "FAIL",
+                  f"missing: run followups.py setup --{key.replace('_', '-')} …")
+    defaults = {"timezone": "system local time", "include_groups": "false (DMs only)",
+                "dev_log": "false (runs reply [SILENT])"}
+    for key, default in defaults.items():
+        if key in cur:
+            check(f"settings.{key}", "OK", str(cur[key]))
+        else:
+            check(f"settings.{key}", "OK", f"not set, using default: {default}")
+
+    # b. the cron job(s) this plugin owns
+    raw, err = _list_cron_jobs()
+    jobs: list[dict] = []
+    if raw is None:
+        check("cron", "FAIL", f"cannot list cron jobs: {err}")
+    else:
+        jobs = [j for j in (_norm_job(r) for r in raw) if _is_ours(j)]
+        if not jobs:
+            check("cron", "WARN", "no follow-up cron job found: nothing will ever run. Create it with "
+                                  "the commands below")
+            suggest += _create_commands()
+        elif len(jobs) > 1:
+            check("cron", "WARN", f"{len(jobs)} follow-up jobs found ({', '.join(j['id'] for j in jobs)}): "
+                                  "the review runs once per job. Remove the extras with "
+                                  "hermes cron remove <id>")
+        else:
+            check("cron", "OK", f"job {jobs[0]['id']} ({jobs[0]['name'] or 'unnamed'})")
+
+    # c. each job
+    scripts = _hermes_home() / "scripts"
+    for job in jobs:
+        jid = job["id"] or "?"
+        broken: list[dict] = []
+        if job["monitor_script"]:
+            check(f"job {jid}: monitor_script", "OK", job["monitor_script"])
+        else:
+            broken.append(check(f"job {jid}: monitor_script", "WARN",
+                                "no monitor script: the agent runs unconditionally every 15 minutes"))
+        deliver = job["deliver"].strip().lower()
+        if deliver == "local":
+            check(f"job {jid}: deliver", "OK", "local")
+        elif not deliver:
+            check(f"job {jid}: deliver", "OK", "not reported by hermes; its default applies")
+        else:
+            broken.append(check(f"job {jid}: deliver", "WARN",
+                                f"deliver={job['deliver']}: every normal run posts its final reply to "
+                                "that chat; use local"))
+        for field in ("script", "monitor_script"):
+            val = job[field]
+            if not val:
+                continue
+            path = Path(val).expanduser()
+            path = path if path.is_absolute() else scripts / path
+            if path.exists():
+                check(f"job {jid}: {field} file", "OK", str(path))
+            else:
+                check(f"job {jid}: {field} file", "FAIL",
+                      f"{path} does not exist: the job fails every run. Copy the helpers back")
+                suggest.append(_create_commands()[0])
+        if not broken:
+            continue
+        edit = ["hermes", "cron", "edit", jid, *FIX_ARGS]
+        # Pointing the job at a monitor script that is not there would make every
+        # run fail (and --failure-deliver origin would then post that every 15 min).
+        wake_ok = (scripts / WAKE_SCRIPT).exists()
+        if not fix or not job["id"] or not wake_ok:
+            if not wake_ok:
+                suggest.append(_create_commands()[0])
+            suggest.append(_cmd(edit))
+            continue
+        rc, out, err = _hermes(*edit[1:])
+        for c in broken:
+            c["fixed"] = rc == 0
+            c["detail"] += (f" — fixed: {_cmd(edit)}" if rc == 0 else
+                            f" — fix failed ({_last_line(err, out) or f'exit {rc}'}): {_cmd(edit)}")
+        if rc != 0:
+            suggest.append(_cmd(edit))
+
+    ok = all(c["status"] == "OK" or c["fixed"] for c in checks)
+    return {"ok": ok, "checks": checks, "jobs": jobs,
+            "suggested_commands": list(dict.fromkeys(suggest))}
+
+
+def cmd_doctor(args) -> int:
+    rep = _doctor(fix=args.fix)
+    if args.json:
+        print(json.dumps(rep, ensure_ascii=False))
+    else:
+        for c in rep["checks"]:
+            status = "FIXED" if c["fixed"] else c["status"]
+            print(f"[{status:<5}] {c['name']}: {c['detail']}")
+        if rep["suggested_commands"]:
+            print("\nRun:" if not args.fix else "\nCould not fix automatically; run:")
+            for cmd in rep["suggested_commands"]:
+                print(f"  {cmd}")
+            if not args.fix and any(" cron edit " in c for c in rep["suggested_commands"]):
+                print("  (or: followups.py doctor --fix)")
+        print("\nok" if rep["ok"] else "\nnot ok")
+    return 0 if rep["ok"] else 1
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -821,6 +1086,12 @@ def main() -> int:
 
     lg = sub.add_parser("log")
     lg.set_defaults(fn=cmd_log)
+
+    dr = sub.add_parser("doctor")
+    dr.add_argument("--fix", action="store_true",
+                    help="edit matching cron jobs in place (monitor script, deliver local)")
+    dr.add_argument("--json", action="store_true")
+    dr.set_defaults(fn=cmd_doctor)
 
     args = ap.parse_args()
     rc = args.fn(args)

@@ -66,6 +66,19 @@ python3 ~/opt/hermes-autonomous/scripts/followups.py setup --owner-id … --dm-t
 
 </details>
 
+### Upgrade
+
+```bash
+hermes plugins update hermes-autonomous
+PLUGIN=~/.hermes/plugins/hermes-autonomous
+python3 $PLUGIN/scripts/followups.py doctor --fix
+```
+
+Jobs created by older versions may lack `--monitor-script` (the agent then runs every 15 minutes no
+matter what) or use `--deliver origin` (every run posts its final reply to your chat). `doctor --fix`
+corrects the job in place with `hermes cron edit` — it never deletes or recreates it. If there is no
+job at all, it prints the commands to create one. Without `--fix` it only reports.
+
 ---
 
 ## What it actually does
@@ -142,8 +155,9 @@ The full teardown and the research numbers (the best models score ~66% F1 on "sh
 - **Network**: the plugin code makes no requests. During a review your agent may look things up
   (weather, prices, news) using Hermes' own tools — that traffic belongs to Hermes, not to this plugin.
 - **Shell**: `/followups` runs one local Python helper (`scripts/followups.py`) with
-  `sys.executable`; the cron helpers are plain Python. No `hermes` subprocess is spawned, no hook,
-  no background thread, no approval bypass.
+  `sys.executable`; the cron helpers are plain Python. The only `hermes` subprocess is `doctor`'s
+  (also run once at the end of `setup`): `hermes cron list`, plus `hermes cron edit` on this plugin's
+  own job when you pass `--fix`. No hook, no background thread, no approval bypass.
 - **Credentials**: none. Your Telegram ids live in the plugin's own `settings.json` (0600) — not in
   `.env`, `auth.json` or any keychain.
 - No telemetry, no analytics.

@@ -1,69 +1,73 @@
-# 判断规范（单一事实来源）
+# Decision rules (single source of truth)
 
-本文件是「要不要跟进」的**唯一权威规则**。`prompts/review.md`（线上 cron 用）和
-`scripts/decide.py`（离线评估用）都必须按它执行；改规则先改这里。
+This file is the **only authoritative rule set** for "should we follow up". `prompts/review.md` (used by the live cron) and
+`scripts/decide.py` (used for offline evaluation) must both follow it; change the rules here first.
 
-## 什么值得跟进
+## Language
 
-过一阵子回来看一眼，会让他觉得**有用**，或者觉得**被记得**。
+The message you send to the owner must be written in the owner's own language: judge it from the owner's most recent messages (Chinese → Chinese, Japanese → Japanese, English → English). Do not write in English just because this file is in English. This applies to `message` and to any developer log.
 
-| why | 例子 | 特点 |
+## What is worth following up
+
+Coming back to take a look after a while would make them feel it was **useful**, or that they were **remembered**.
+
+| why | example | trait |
 |---|---|---|
-| `care` | 他说喉咙痛、面试、等结果 → 第二天问一句「好点没」 | **不需要行动价值** |
-| `utility` | 明天出门看天气、航班延误、说明书、截止日 | 读完能改变决定 |
-| `risk` | 要花钱/签约/寄东西 → 提前提醒坑 | 防损失 |
-| `curiosity` | mint 的 NFT、聊到的公司或事件 → 过一阵看后续 | 有新信息才有意义 |
+| `care` | they mention a sore throat, an interview, waiting for results → ask "feeling better?" the next day | **needs no action value** |
+| `utility` | weather before going out tomorrow, flight delays, leaflets, deadlines | reading it can change a decision |
+| `risk` | about to spend money / sign / ship something → warn about pitfalls in advance | prevents loss |
+| `curiosity` | a minted NFT, a company or event they mentioned → check the follow-up after a while | only meaningful with new information |
 
-反面：已经彻底结束、再提就是啰嗦的事，不要记。
+Counter-case: things completely over, where bringing them up again would be nagging — don't record them.
 
-## 两条评分线（各自独立，任一过线即可）
+## Two scoring lines (independent; passing either one is enough)
 
 ```
-实用线   相关0-2 + 变化0-2 + 可行动0-2 + 时效0-2 − 风险0-2   ≥5 发
-关心线   是真事 / 细节具体 / 时机对 / 没重复              四条全过就发
+Utility line   relevance 0-2 + change 0-2 + actionable 0-2 + timing 0-2 − risk 0-2   ≥5: send
+Care line      real / specific / right timing / not repeated                           all four pass: send
 ```
 
-关心线必须真的“关心”：问“好点没”、记得住细节，**不是**把用药说明再讲一遍。
-给建议 ≠ 关心；care 类默认是问候 + 一个具体细节，不是科普。
+The care line must be real "care": asking "feeling better?", remembering details — **not** repeating the medicine instructions.
+Giving advice ≠ caring; a care item defaults to a greeting + one specific detail, not a lecture.
 
-## 动作三档
+## Three actions
 
-- `silent`：不发。必须说明原因（没变化 / 时机不对 / 重复 / 没来源）。
-- `act_report`：只读查询就能得出答案（天气、价格、说明书、新闻）→ 查完写进消息。
-- `ask`：改日历、设提醒、给别人发消息、花钱 → 只提议，不动手。
+- `silent`: don't send. A reason is required (no change / wrong timing / repeated / no source).
+- `act_report`: a read-only lookup gives the answer (weather, prices, leaflets, news) → look it up and put it in the message.
+- `ask`: changing the calendar, setting reminders, messaging others, spending money → only propose, don't act.
 
-## 确定性闸门（代码执行，不靠模型自觉）
+## Deterministic gates (enforced by code, not by model discipline)
 
-| 闸门 | 条件 | 效果 |
+| gate | condition | effect |
 |---|---|---|
-| 夜间 | 23:00–08:00 | 可以判断，消息不发 |
-| 冷却 | 距上次发送 <90 分钟 | 消息不发 |
-| 到期 | `revisit_at <= now` 且 `sent_at < revisit_at` | 才算 due |
-| 无变化 | 与上次讨论相比没有新信息 | 只能 silent |
-| 上限 | ≤3 项、≤6 行 | 截断 |
+| night | 23:00–08:00 | may decide, message not sent |
+| cooldown | <90 minutes since the last send | message not sent |
+| due | `revisit_at <= now` and `sent_at < revisit_at` | only then counts as due |
+| no change | no new information compared to the last discussion | silent only |
+| cap | ≤3 items, ≤6 lines | truncated |
 
-## 离线评估模式（重要）
+## Offline evaluation mode (important)
 
-用 `scripts/decide.py` 跑场景时你**没有工具**：天气、电价、价格、车次一律查不到。
+When running scenarios with `scripts/decide.py` you **have no tools**: weather, electricity prices, prices, train times — none can be looked up.
 
-- 需要实时数据的地方写成占位符：`<北京 15:00 天气>`、`<市区→会场车程>`，**绝不许编造具体数字或日期**。
-- 判断本身照常做（该不该 act_report、消息结构对不对），只是数据留空。
-- 线上 cron 有工具，会把这些占位符换成真实查询结果。
+- Where live data is needed, write a placeholder: `<Beijing 15:00 weather>`, `<downtown → venue travel time>`; **never make up specific numbers or dates**.
+- Do the judgment itself as usual (whether to act_report, whether the message structure is right); just leave the data blank.
+- The live cron has tools and will replace these placeholders with real lookup results.
 
-## 输出
+## Output
 
 ```json
 {
-  "new_followups": [{"key":"throat-1030","why":"care","subject":"喉咙痛","quote":"…","revisit_at":"+12h"}],
+  "new_followups": [{"key":"throat-1030","why":"care","subject":"sore throat","quote":"…","revisit_at":"+12h"}],
   "decisions": [{"id":3,"action":"act_report","reason":"…","score":{"relevance":2,"change":1,"action":1,"timing":2,"risk":0}}],
   "message": "💊 …",
-  "silent_actions": ["查了天气，明天不下雨，没发"]
+  "silent_actions": ["checked the weather, no rain tomorrow, didn't send"]
 }
 ```
 
-`message: null` 是正常结果，不是失败。
+`message: null` is a normal result, not a failure.
 
-## 评估方式
+## How to evaluate
 
-`scripts/decide.py --scenario scenarios/<case>.json` 跑一个场景；把 JSON 发给用户，
-由用户判断“这条该不该发、话术对不对”。场景文件格式见 `scenarios/01-throat.json`。
+`scripts/decide.py --scenario scenarios/<case>.json` runs one scenario; send the JSON to the user,
+who judges "should this be sent, is the wording right". See `scenarios/01-throat.json` for the scenario file format.

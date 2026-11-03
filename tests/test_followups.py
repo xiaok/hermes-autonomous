@@ -829,21 +829,35 @@ class PromptContract(Home):
         # The no-resend rules must sit in §3 (handling due items), where they are read
         # before the scoring, not somewhere the agent reaches after deciding.
         s3 = self.text.split("## 3.", 1)[1].split("## 4.", 1)[0]
-        for needle in ("sends >= 1", "事件已过", "`why=care` 且 `sends >= 2`", "sent_text"):
+        for needle in ("sends >= 1", "event passed", "`why=care` and `sends >= 2`", "sent_text"):
             self.assertIn(needle, s3)
 
     def test_final_reply_silent_unless_dev_log(self):
         # The final reply is delivered to the user's chat: default must be [SILENT],
         # the developer log only behind dev_log=true.
         s6 = self.text.split("## 6.", 1)[1].split("## 7.", 1)[0]
-        self.assertIn("`dev_log` 不为 true（默认）→ 最终回复必须是 `[SILENT]`", s6)
-        self.assertIn("只有 `dev_log=true`", s6)
+        self.assertIn("`dev_log` is not true (the default) → the final reply must be `[SILENT]`", s6)
+        self.assertIn("Only when `dev_log=true`", s6)
 
     def test_empty_parts_as_documented(self):
-        # §5: "没有的部分给空列表或 null；watermark 必须有。"
+        # §5: "Parts you don't have get an empty list or null; watermark is required."
         doc = {"new_followups": [], "outcomes": None, "close": [], "decisions": [],
                "sent": None, "watermark": 1.0}
         self.assertTrue(self.apply(doc)["ok"])
+
+
+class PromptLanguage(unittest.TestCase):
+    """Both prompts are in English, but the owner must be answered in their own
+    language. Guard the rule so a later edit can't silently drop it."""
+
+    def test_language_rule_in_both_prompts(self):
+        for name in ("review.md", "decide.md"):
+            with self.subTest(prompt=name):
+                text = (ROOT / "prompts" / name).read_text(encoding="utf-8")
+                paras = [p for p in text.split("\n\n")
+                         if "owner's own language" in p and "message you send to the owner" in p]
+                self.assertTrue(paras, f"language rule missing from prompts/{name}")
+                self.assertIn("most recent messages", paras[0])
 
 
 class SendCount(Home):

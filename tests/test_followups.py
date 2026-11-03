@@ -11,6 +11,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
+import re
 import shutil
 import sqlite3
 import stat
@@ -28,6 +29,7 @@ ROOT = Path(__file__).resolve().parent.parent
 FOLLOWUPS = ROOT / "scripts" / "followups.py"
 WAKE = ROOT / "scripts" / "wake.py"
 OWNER = "4242"
+CJK = re.compile(r"[一-鿿]")
 
 # Stand-in for the `hermes` CLI: `cron list [--json]` and `cron edit` over a
 # jobs.json next to it; every call is appended to calls.jsonl.
@@ -656,9 +658,9 @@ class ReadOnlyCommands(Home):
     def test_why_and_log_empty_state(self):
         before = self.snapshot()
         why = self.fu("why").stdout
-        self.assertIn("（无）", why)
-        self.assertIn("还没有复盘记录", why)
-        self.assertIn("还没有复盘记录", self.fu("log").stdout)
+        self.assertIn("(none)", why)
+        self.assertIn("no reviews yet", why)
+        self.assertIn("no reviews yet", self.fu("log").stdout)
         self.assertEqual(self.snapshot(), before)
 
     def test_why_and_log_with_data(self):
@@ -687,8 +689,8 @@ class ReadOnlyCommands(Home):
         plugin = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(plugin)
         with mock.patch.dict(os.environ, self.env, clear=True):  # the subprocess inherits it
-            self.assertIn("还没有复盘记录", plugin._followups_command("log"))
-            self.assertIn("静默中的类别", plugin._followups_command("why"))
+            self.assertIn("no reviews yet", plugin._followups_command("log"))
+            self.assertIn("Muted categories", plugin._followups_command("why"))
 
 
 class WakeHold(Home):
@@ -1149,6 +1151,17 @@ class Doctor(Home):
         self.assertEqual(status["settings.timezone"], "OK")
         self.assertFalse(rep["ok"])
 
+    def test_text_output_is_english_but_keeps_job_names(self):
+        self.set_jobs([self.job(id="j2", name="主动跟进", monitor_script=None)])
+        p = self.run_cli(FOLLOWUPS, "doctor")
+        self.assertEqual(p.returncode, 1)
+        self.assertIn("[OK   ] settings.owner_id", p.stdout)
+        self.assertIn("[WARN ] job j2: monitor_script", p.stdout)
+        self.assertIn("cron edit j2", p.stdout)
+        self.assertIn("not ok", p.stdout)
+        self.assertIn("主动跟进", p.stdout)  # the user's own job name, not translated
+        self.assertIsNone(CJK.search(p.stdout.replace("主动跟进", "")), p.stdout)
+
     def test_setup_prints_warn_summary_but_succeeds(self):
         p = self.fu("setup", "--dev-log")  # no cron job exists: doctor warns
         json.loads(p.stdout)  # stdout stays one JSON document
@@ -1222,6 +1235,25 @@ class PluginCommandHome(Home):
                 mock.patch.dict(sys.modules, {"hermes_constants": None}):
             env = self.capture_env()
         self.assertEqual(env["HERMES_HOME"], str(Path.home() / ".hermes"))
+
+    def test_usage_and_errors_are_english(self):
+        def silent(cmd, **kw):
+            return subprocess.CompletedProcess(cmd, 0, "", "")
+
+        def hang(cmd, **kw):
+            raise subprocess.TimeoutExpired(cmd, kw.get("timeout"))
+
+        with mock.patch.object(self.plugin.subprocess, "run", silent):
+            usage = self.plugin._followups_command("")
+        with mock.patch.object(self.plugin.subprocess, "run", hang):
+            timeout = self.plugin._followups_command("doctor")
+        with mock.patch.object(self.plugin, "SCRIPT", self.other / "missing.py"):
+            missing = self.plugin._followups_command("list")
+        self.assertTrue(usage.startswith("Usage: /followups"), usage)
+        self.assertTrue(timeout.startswith("Failed to read: TimeoutExpired"), timeout)
+        self.assertTrue(missing.startswith("Cannot find"), missing)
+        for text in (usage, timeout, missing):
+            self.assertIsNone(CJK.search(text), text)
 
     def test_real_helper_reads_current_profile_board(self):
         self.add("only-in-current-profile")

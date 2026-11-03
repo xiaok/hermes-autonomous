@@ -320,8 +320,8 @@ def cmd_digest(args) -> int:
         "night": _is_night(),
         "muted": muted_whys(conn, now),
         "dev_log": dev_log(),
-        "instructions": "见 prompts/review.md：产出一份 apply JSON（watermark 用 next_watermark），"
-                        "需要私聊就先 hermes send，再 followups.py apply 一次写回。",
+        "instructions": "See prompts/review.md: produce one apply JSON (watermark = next_watermark); "
+                        "to DM the owner, hermes send first, then write back with one followups.py apply.",
     }
     print(json.dumps(payload, ensure_ascii=False))
     return 0
@@ -728,22 +728,22 @@ def _sent_ids(doc: dict) -> list:
 def cmd_why(_args) -> int:
     conn = connect()
     muted = muted_whys(conn)
-    print(f"静默中的类别（近 30 天：annoyed 1 次 / ignored {MUTE_IGNORED_AFTER} 次即静默）：")
+    print(f"Muted categories (last 30 days: muted after 1 annoyed / {MUTE_IGNORED_AFTER} ignored):")
     for why, reason in sorted(muted.items()):
         print(f"  {why}: {reason}")
     if not muted:
-        print("  （无）")
+        print("  (none)")
     runs = _recent_runs(conn, 5)
-    print("最近 5 次复盘的决策：")
+    print("Decisions from the last 5 reviews:")
     for run_at, doc in runs:
         decisions = [d for d in doc.get("decisions") or [] if isinstance(d, dict)]
         if not decisions:
-            print(f"  {_iso(run_at)[:16]}  （无决策）")
+            print(f"  {_iso(run_at)[:16]}  (no decisions)")
         for d in decisions:
             reason = str(d.get("reason") or "").replace("\n", " ")[:80]
             print(f"  {_iso(run_at)[:16]}  #{d.get('id')} {d.get('action')}  {reason}".rstrip())
     if not runs:
-        print("  （还没有复盘记录）")
+        print("  (no reviews yet)")
     return 0
 
 
@@ -757,7 +757,7 @@ def cmd_log(_args) -> int:
         mode = "review" if decisions or sent else "capture"
         print(f"{_iso(run_at)[:16]}  mode={mode:<7}  sent={len(sent)}  decisions={len(decisions)}")
     if not runs:
-        print("（还没有复盘记录）")
+        print("(no reviews yet)")
     return 0
 
 

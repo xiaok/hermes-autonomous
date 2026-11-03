@@ -27,11 +27,11 @@
 ```bash
 hermes plugins install xiaok/hermes-autonomous --enable
 PLUGIN=~/.hermes/plugins/hermes-autonomous
-python3 $PLUGIN/scripts/followups.py setup --owner-id <你的 Telegram user id> --dm-target telegram:<chat_id>
+python3 $PLUGIN/scripts/followups.py setup --owner-id <your Telegram user id> --dm-target telegram:<chat_id>
 cp $PLUGIN/cron/*.py ~/.hermes/scripts/
-hermes cron create "*/15 * * * *" --name "主动跟进" \
+hermes cron create "*/15 * * * *" --name "proactive follow-ups" \
   --monitor-script followup-wake.py --script followup-digest.py \
-  --prompt "读 $PLUGIN/prompts/review.md 并执行" \
+  --prompt "Read $PLUGIN/prompts/review.md and follow it" \
   --deliver local --failure-deliver origin
 ```
 

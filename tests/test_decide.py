@@ -29,7 +29,7 @@ class ApplyGatesTest(unittest.TestCase):
     def assertBlocked(self, out: dict) -> None:
         self.assertIsNone(out["message"])
         self.assertFalse(out["gates"]["sent"])
-        self.assertTrue(any("闸门拦下" in s for s in out.get("silent_actions", [])))
+        self.assertTrue(any("blocked by gate" in s for s in out.get("silent_actions", [])))
 
     def test_night_blocks(self):
         for now in (NIGHT, EARLY):

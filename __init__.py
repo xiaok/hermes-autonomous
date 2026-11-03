@@ -27,16 +27,17 @@ def _hermes_home() -> str:
         return os.environ.get("HERMES_HOME") or str(Path.home() / ".hermes")
 
 _USAGE = (
-    "用法：/followups [list|due|why|log|doctor [--fix]|close <id>|checked <id>|outcome <id> --value …]\n"
-    "不带参数 = 看全部（含已关闭）。why = 哪些类别被静默 + 最近决策；log = 最近 10 次复盘；"
-    "doctor = 检查配置和定时任务（只读），doctor --fix = 原地修正定时任务。"
+    "Usage: /followups [list|due|why|log|doctor [--fix]|close <id>|checked <id>|outcome <id> --value …]\n"
+    "No arguments = show everything (including closed). why = muted categories + recent decisions; "
+    "log = last 10 reviews; doctor = check config and the cron job (read-only), "
+    "doctor --fix = repair the cron job in place."
 )
 
 
 def _followups_command(raw_args: str) -> str:
     """Thin chat wrapper over scripts/followups.py so the user can see the board."""
     if not SCRIPT.exists():
-        return f"找不到 {SCRIPT}（插件目录不完整）"
+        return f"Cannot find {SCRIPT} (the plugin directory is incomplete)"
 
     args = (raw_args or "").split()
     allowed = {"list", "due", "close", "checked", "outcome", "add", "why", "log", "doctor"}
@@ -52,12 +53,12 @@ def _followups_command(raw_args: str) -> str:
         proc = subprocess.run(cmd, capture_output=True, text=True, env=env,
                               timeout=120 if sub == "doctor" else 20)
     except Exception as exc:  # noqa: BLE001 - a chat command must never raise
-        return f"读取失败：{type(exc).__name__}: {exc}"
+        return f"Failed to read: {type(exc).__name__}: {exc}"
     out = (proc.stdout or "").strip()
     if out:
         return out
     err = (proc.stderr or "").strip().splitlines()
-    return f"读取失败：{err[-1]}" if err else _USAGE
+    return f"Failed to read: {err[-1]}" if err else _USAGE
 
 
 def register(ctx) -> None:

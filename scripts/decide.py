@@ -66,16 +66,16 @@ def parse_when(s: str, now: datetime) -> datetime:
 
 def build_prompt(scenario: dict, now: datetime) -> str:
     rubric = (ROOT / "prompts/decide.md").read_text(encoding="utf-8")
-    lines = [rubric, "", "## 场景", "", f"现在：{now.isoformat(timespec='minutes')}", ""]
-    lines.append("### 对话")
+    lines = [rubric, "", "## Scenario", "", f"Now: {now.isoformat(timespec='minutes')}", ""]
+    lines.append("### Conversation")
     for m in scenario.get("history", []):
-        role = "他" if m.get("role") == "user" else "你"
-        lines.append(f"- [{m.get('t','')}] {role}：{m.get('text','').strip()}")
+        role = "owner" if m.get("role") == "user" else "assistant"
+        lines.append(f"- [{m.get('t','')}] {role}: {m.get('text','').strip()}")
     lines.append("")
-    lines.append("### 现行跟进点")
+    lines.append("### Current follow-ups")
     fs = scenario.get("followups", [])
     if not fs:
-        lines.append("（无）")
+        lines.append("(none)")
     for f in fs:
         lines.append(
             f"- id={f.get('id')} why={f.get('why')} subject={f.get('subject')} "
@@ -83,7 +83,7 @@ def build_prompt(scenario: dict, now: datetime) -> str:
             f"sent_at={f.get('sent_at')} checks={f.get('checks',0)}"
         )
     lines.append("")
-    lines.append("现在给出 JSON：")
+    lines.append("Now output the JSON:")
     return "\n".join(lines)
 
 
@@ -121,7 +121,7 @@ def apply_gates(result: dict, scenario: dict, now: datetime) -> dict:
     msg = result.get("message")
     if msg and (night or cooling):
         result.setdefault("silent_actions", []).append(
-            f"消息被闸门拦下（{'夜间' if night else '冷却中'}）：{msg[:60]}…")
+            f"message blocked by gate ({'night' if night else 'cooldown'}): {msg[:60]}…")
         result["message"] = None
         msg = None
     if msg:
@@ -163,15 +163,15 @@ def main() -> int:
         print(json.dumps(result, ensure_ascii=False, indent=2))
         return 0
 
-    print(f"新跟进点：{len(result.get('new_followups') or [])}")
+    print(f"New follow-ups: {len(result.get('new_followups') or [])}")
     for f in result.get("new_followups") or []:
         print(f"  + [{f.get('why')}] {f.get('subject')} → {f.get('revisit_at')}")
-    print("判断：")
+    print("Decisions:")
     for d in result.get("decisions") or []:
         print(f"  #{d.get('id')} {d.get('action'):<10} {d.get('reason','')}")
-    print("静默动作：" + ("；".join(result.get("silent_actions") or []) or "无"))
-    print("\n消息：\n" + (result.get("message") or "（无，静默）"))
-    print(f"\n闸门：{result.get('gates')}")
+    print("Silent actions: " + ("; ".join(result.get("silent_actions") or []) or "none"))
+    print("\nMessage:\n" + (result.get("message") or "(none — stayed silent)"))
+    print(f"\nGates: {result.get('gates')}")
     return 0
 
 

@@ -97,10 +97,19 @@ Four things have to be true before it speaks:
 | Due | that specific thing is worth revisiting *now* — not a fixed 9am digest |
 | New | something changed since you last talked about it; a repeat is not a follow-up |
 | Sourced | it can quote what you actually said; no source, no message |
-| Rationed | ≤1 message per wake, ≤3 items, 90-minute cooldown, silence 23:00–08:00 |
+| Rationed | ≤3 items and ≤6 lines per message, 90-minute cooldown, silence 23:00–08:00 |
 
-And the reason it does not become noise: **silence is a scored outcome.** Ignored items demote
-themselves; a class of follow-up you shrugged at three times stops speaking.
+The first three are judgment calls the agent makes against the rubric. The last one is enforced in
+code: every DM goes out through `followups.py send`, which refuses at night, during the cooldown,
+for more than 3 items or more than 6 lines. A refused message is not sent and not shortened — that
+run simply ends without one. The cooldown also means one message per wake at most.
+
+And the reason it does not become noise: **your reactions are written back.** At the start of each
+review the agent records how you reacted to what it sent in the last 48 hours (`accepted`,
+`ignored`, `annoyed`, `useless`). Within 30 days, one `annoyed` or three `ignored` on sent items mute
+that whole category (`care` / `utility` / `risk` / `curiosity`): its due items no longer wake a
+review, the digest marks them held, and `send` refuses them. Muting only happens once those outcomes
+have been recorded; `followups.py why` shows what is muted.
 
 ## Two kinds of value (the part most assistants miss)
 
@@ -120,8 +129,8 @@ completion write-back, configuration pushed onto the user.
 
 This one binds to events, writes every outcome back, and asks for nothing but a yes/no answer in chat.
 The full teardown and the research numbers (the best models score ~66% F1 on "should I speak", with
-35–48% precision) are in [`docs/RESEARCH.md`](docs/RESEARCH.md) and
-[`docs/teardown.md`](docs/teardown.md).
+35–48% precision) are in [`docs/RESEARCH.md`](docs/RESEARCH.md) (Chinese) and
+[`docs/teardown.md`](docs/teardown.md) (Chinese).
 
 ## How it decides
 
@@ -129,7 +138,9 @@ The full teardown and the research numbers (the best models score ~66% F1 on "sh
   scoring lines, the three action tiers.
 - [`scripts/decide.py`](scripts/decide.py) — run any scenario offline and see the exact judgment:
   `python3 scripts/decide.py --scenario scenarios/01-throat.json`
-- [`docs/DECIDER.md`](docs/DECIDER.md) — inputs, gates, output schema.
+- [`docs/DECIDER.md`](docs/DECIDER.md) (Chinese) — inputs, gates, output schema.
+
+The conversations in `scenarios/` are made-up examples; they do not belong to any real user.
 
 ## Your data
 
@@ -148,26 +159,38 @@ The full teardown and the research numbers (the best models score ~66% F1 on "sh
 
 - **Reads** the Hermes session database `~/.hermes/state.db` — read-only, only sessions owned by your
   user id: user and assistant turns in your DM; group, thread, forum and channel sessions (all
-  members' messages) only with `include_groups`. No other files are read.
-- **Writes** only its own data directory `~/.hermes/plugin-data/hermes-autonomous/`
-  (SQLite board + `settings.json`, mode 0600).
+  members' messages) only with `include_groups`.
+- **Reads** Hermes' cron job store `~/.hermes/cron/jobs.json` (read-only) when `doctor` runs — also
+  once at the end of `setup` — to find this plugin's job. If the store can't be read it falls back to
+  `hermes cron list`. Besides that it reads only its own settings.
+- **Writes** its own data directory `~/.hermes/plugin-data/hermes-autonomous/`
+  (SQLite board + `settings.json`, mode 0600; plus a `send.lock` file).
+- **Copies** the two cron helpers (`cron/followup-wake.py`, `cron/followup-digest.py`) into
+  `~/.hermes/scripts/` at install time — your agent does this, or you do with the `cp` above. That is
+  where the job's `--script` / `--monitor-script` names are looked up.
+- **Modifies its own cron job** with `doctor --fix`: `hermes cron edit <id> --monitor-script … --deliver
+  local --failure-deliver origin` on the job it recognises as this plugin's. Never another job, never
+  delete or recreate; without `--fix` it only reports.
 - **Network**: the plugin code makes no requests. During a review your agent may look things up
   (weather, prices, news) using Hermes' own tools — that traffic belongs to Hermes, not to this plugin.
 - **Shell**: `/followups` runs one local Python helper (`scripts/followups.py`) with
-  `sys.executable`; the cron helpers are plain Python. The only `hermes` subprocess is `doctor`'s
-  (also run once at the end of `setup`): `hermes cron list`, plus `hermes cron edit` on this plugin's
-  own job when you pass `--fix`. During a review the agent itself uses its terminal tool to run
-  this plugin's helpers (`followups.py digest`, `followups.py apply`, …) and `hermes send` to
-  message you in your DM. The offline tool `scripts/decide.py` calls `hermes -z` for one
-  tool-less model call — only when you run it yourself. No hook, no background thread, no approval
-  bypass.
+  `sys.executable`; the cron helpers are plain Python. `followups.py` starts `hermes` in two places:
+  `doctor` (`hermes cron list` as the fallback above, `hermes cron edit` with `--fix`) and
+  `followups.py send`, which runs `hermes send` to deliver the DM after its gates pass. During a review
+  the agent itself uses its terminal tool to run this plugin's helpers (`followups.py digest`,
+  `followups.py send`, `followups.py apply`, …). The offline tool `scripts/decide.py` calls `hermes -z`
+  for one tool-less model call — only when you run it yourself. No hook, no background thread, no
+  approval bypass.
 - **Credentials**: none. Your Telegram ids live in the plugin's own `settings.json` (0600) — not in
   `.env`, `auth.json` or any keychain.
 - No telemetry, no analytics.
 
 ## Docs
 
-[中文说明](README.zh-CN.md) · [Design](docs/DESIGN.md) · [Research](docs/RESEARCH.md) ·
-[Decider](docs/DECIDER.md)
+[中文说明](README.zh-CN.md) · [Design](docs/DESIGN.md) (Chinese) ·
+[Research](docs/RESEARCH.md) (Chinese) · [Decider](docs/DECIDER.md) (Chinese) ·
+[Teardown](docs/teardown.md) (Chinese)
+
+Tested with Hermes Agent 0.22.2 (`requires_hermes: ">=0.22.2"`).
 
 MIT.

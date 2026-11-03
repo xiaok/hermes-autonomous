@@ -32,12 +32,14 @@ OWNER = "4242"
 CJK = re.compile(r"[一-鿿]")
 WM0 = time.time() - 3600  # a realistic cursor: recent enough for the fresh-board floor
 
-# Stand-in for the `hermes` CLI: `cron list [--json]` and `cron edit` over a
-# jobs.json next to it, and `send`, which answers with send_reply.json (default:
-# a delivered message) and logs its stdin body to sends.jsonl; every call is
+# Stand-in for the `hermes` CLI: `cron list [--json]` over a jobs.json next to it
+# (only reached when doctor cannot read the real store), `cron edit`, which edits
+# the real store $HERMES_HOME/cron/jobs.json when there is one (else the jobs.json
+# next to it), and `send`, which answers with send_reply.json (default: a
+# delivered message) and logs its stdin body to sends.jsonl; every call is
 # appended to calls.jsonl.
 FAKE_HERMES = '''#!{python}
-import json, sys
+import json, os, sys
 from pathlib import Path
 here = Path(__file__).resolve().parent
 args = sys.argv[1:]
@@ -53,14 +55,20 @@ if args[:1] == ["send"]:
     print(json.dumps(doc, indent=2))
     sys.exit(0 if doc.get("success") and not doc.get("error") else 1)
 jobs = json.loads((here / "jobs.json").read_text())
+store = Path(os.environ["HERMES_HOME"]) / "cron" / "jobs.json"
 if args[:2] == ["cron", "list"]:
     print(json.dumps(jobs) if "--json" in args else "(text)")
 elif args[:2] == ["cron", "edit"]:
-    job = next(j for j in jobs if j["id"] == args[2])
+    doc = json.loads(store.read_text()) if store.exists() else None
+    target = doc["jobs"] if doc is not None else jobs
+    job = next(j for j in target if j["id"] == args[2])
     rest = args[3:]
     for flag, val in zip(rest[::2], rest[1::2]):
         job[flag[2:].replace("-", "_")] = val
-    (here / "jobs.json").write_text(json.dumps(jobs))
+    if doc is not None:
+        store.write_text(json.dumps(doc))
+    else:
+        (here / "jobs.json").write_text(json.dumps(jobs))
 else:
     sys.exit(2)
 '''
@@ -115,7 +123,7 @@ class Home(unittest.TestCase):
         self.bin.mkdir()
         (self.bin / "hermes").write_text(FAKE_HERMES.format(python=sys.executable))
         (self.bin / "hermes").chmod(0o755)
-        self.set_jobs([])
+        Home.set_jobs(self, [])  # the fake CLI's list; Doctor overrides set_jobs for the store
         self.env["PATH"] = f"{self.bin}{os.pathsep}{self.env.get('PATH', '')}"
 
     # -- helpers ---------------------------------------------------------------
@@ -1084,6 +1092,7 @@ class Doctor(Home):
         for name in ("followup-wake.py", "followup-digest.py"):
             (scripts / name).write_text("")
         (self.bin / "calls.jsonl").unlink(missing_ok=True)  # forget setup's own doctor run
+        self.set_jobs([])
 
     def test_create_command_uses_a_positional_prompt(self):
         # `hermes cron create` has no --prompt flag; the prompt is positional.
@@ -1097,12 +1106,34 @@ class Doctor(Home):
         self.assertLess(cmd.index("prompts/review.md"), cmd.index("--name"))
 
     def job(self, **over) -> dict:
-        j = {"id": "a1b2c3", "name": "proactive follow-ups", "script": "followup-digest.py",
-             "prompt": "Read /x/prompts/review.md and follow it",
-             "monitor_script": "followup-wake.py", "deliver": "local",
-             "failure_deliver": "origin"}
+        """One entry shaped like Hermes 0.22.2's own store: unset fields are null,
+        not absent, and there is no failure_deliver until `cron edit` sets one."""
+        j = {"id": "a1b2c3", "name": "proactive follow-ups",
+             "prompt": "Read /x/prompts/review.md and follow it", "skills": [], "skill": None,
+             "model": None, "provider": None, "base_url": None,
+             "script": "followup-digest.py", "no_agent": False,
+             "monitor_script": "followup-wake.py", "monitor_url": None, "monitor_state": None,
+             "context_from": None,
+             "schedule": {"kind": "cron", "expr": "*/15 * * * *"},
+             "schedule_display": "*/15 * * * *", "repeat": {"times": None, "completed": 0},
+             "enabled": True, "state": "scheduled", "paused_at": None, "paused_reason": None,
+             "created_at": "2026-10-01T09:00:00+00:00", "next_run_at": None,
+             "last_run_at": None, "last_status": None, "last_error": None,
+             "deliver": "local", "origin": None, "enabled_toolsets": None, "workdir": None}
         j.update(over)
-        return {k: v for k, v in j.items() if v is not None}
+        return j
+
+    def set_jobs(self, jobs: list[dict]):
+        """Doctor reads $HERMES_HOME/cron/jobs.json first; write that, not the fake CLI."""
+        store = self.home / "cron" / "jobs.json"
+        store.parent.mkdir(exist_ok=True)
+        store.write_text(json.dumps({"jobs": jobs, "updated_at": "2026-11-01T00:00:00+00:00"}))
+
+    def store_jobs(self) -> list[dict]:
+        return json.loads((self.home / "cron" / "jobs.json").read_text())["jobs"]
+
+    def listed_via_cli(self) -> bool:
+        return any(c[:2] == ["cron", "list"] for c in self.hermes_calls())
 
     def doctor(self, *args: str):
         p = self.run_cli(FOLLOWUPS, "doctor", "--json", *args)
@@ -1120,10 +1151,44 @@ class Doctor(Home):
         p, rep = self.doctor("--fix")
         self.assertTrue(rep["ok"])
         self.assertEqual(self.edits(), [])
+        self.assertFalse(self.listed_via_cli(), "a readable store must not fall back to the CLI")
+
+    def test_store_without_failure_deliver_is_healthy(self):
+        # The real store carries no failure_deliver for this job; doctor must not
+        # treat its absence as broken (and so must not keep editing the job).
+        job = self.job()
+        self.assertNotIn("failure_deliver", job)
+        self.set_jobs([job])
+        _, rep = self.doctor("--fix")
+        self.assertTrue(rep["ok"], rep)
+        self.assertEqual(self.edits(), [])
+
+    def test_disabled_job_is_still_found(self):
+        self.set_jobs([self.job(enabled=False, state="paused", monitor_script=None)])
+        _, rep = self.doctor()
+        self.assertEqual([j["id"] for j in rep["jobs"]], ["a1b2c3"])
+        self.assertIn("job a1b2c3: monitor_script",
+                      {c["name"] for c in rep["checks"] if c["status"] == "WARN"})
+
+    def test_falls_back_to_the_cli_without_a_store(self):
+        (self.home / "cron" / "jobs.json").unlink()
+        Home.set_jobs(self, [self.job()])  # only the fake CLI knows the job now
+        _, rep = self.doctor()
+        self.assertTrue(rep["ok"], rep)
+        self.assertEqual([j["id"] for j in rep["jobs"]], ["a1b2c3"])
+        self.assertTrue(self.listed_via_cli())
+
+    def test_unreadable_store_falls_back_to_the_cli(self):
+        (self.home / "cron" / "jobs.json").write_text("{not json")
+        Home.set_jobs(self, [self.job()])
+        _, rep = self.doctor()
+        self.assertEqual([j["id"] for j in rep["jobs"]], ["a1b2c3"])
+        self.assertTrue(self.listed_via_cli())
 
     def test_old_job_warns_and_fix_edits_it_in_place(self):
-        self.set_jobs([self.job(monitor_script=None, deliver="origin", failure_deliver=None),
-                       {"id": "zzz999", "name": "unrelated", "deliver": "origin"}])
+        other = self.job(id="zzz999", name="unrelated", prompt="check the mailbox",
+                         script="mailbox.py", monitor_script=None, deliver="origin")
+        self.set_jobs([self.job(monitor_script=None, deliver="origin"), other])
         p, rep = self.doctor()
         self.assertEqual(p.returncode, 1)
         self.assertFalse(rep["ok"])
@@ -1135,10 +1200,16 @@ class Doctor(Home):
         self.assertTrue(rep["ok"], rep)
         self.assertEqual(self.edits(), [["cron", "edit", "a1b2c3", *self.FIX]])
         self.assertTrue(all(c["fixed"] for c in rep["checks"] if c["status"] == "WARN"))
+        # The edit landed in the store: ours fixed, the unrelated job untouched.
+        ours, theirs = self.store_jobs()
+        self.assertEqual((ours["monitor_script"], ours["deliver"], ours["failure_deliver"]),
+                         ("followup-wake.py", "local", "origin"))
+        self.assertEqual(theirs, other)
         # Idempotent: the job is now right, a second --fix leaves it alone.
         _, rep = self.doctor("--fix")
         self.assertTrue(rep["ok"])
         self.assertEqual(len(self.edits()), 1)
+        self.assertFalse(self.listed_via_cli())
 
     def test_missing_wake_script_is_not_wired_in(self):
         (self.home / "scripts" / "followup-wake.py").unlink()
@@ -1852,3 +1923,145 @@ class NoAuthorPaths(unittest.TestCase):
                            capture_output=True, text=True, env=env, timeout=30)
         self.assertEqual(p.returncode, 2, p.stdout + p.stderr)
         self.assertIn("hermes not found on PATH", p.stderr)
+
+
+class DecidePromptContract(Home):
+    """prompts/decide.md shows the decider's output shape. Its new_followups are the
+    same records the live run hands to `apply`, so the example must be accepted as is."""
+
+    PROMPT = ROOT / "prompts" / "decide.md"
+
+    def output_example(self) -> dict:
+        text = self.PROMPT.read_text(encoding="utf-8")
+        m = re.search(r"## Output\s+```json\n(.*?)\n```", text, re.S)
+        self.assertIsNotNone(m, "output example not found in prompts/decide.md")
+        return json.loads(m.group(1))
+
+    def test_new_followups_example_applies(self):
+        self.setup_owner()
+        nf = self.output_example()["new_followups"]
+        self.assertGreaterEqual(len(nf), 1)
+        p = self.fu("apply", stdin=json.dumps({"new_followups": nf, "watermark": WM0}), ok=False)
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        out = json.loads(p.stdout)
+        self.assertTrue(out["ok"], out)
+        self.assertEqual(len(out["added"]), len(nf))
+        for f in nf:
+            r = self.db().execute("SELECT kind, why, subject FROM followups WHERE key=?",
+                                  (f["key"],)).fetchone()
+            self.assertEqual(tuple(r), (f["kind"], f["why"], f["subject"]))
+
+
+class WakeDigestAgree(Home):
+    """wake and digest read one send_gate. For the same DB, wake's line and digest's
+    mode / may_send / held_reason must say the same thing:
+    review ids X ↔ may_send=true and X = the due, unheld ids;
+    held R      ↔ may_send=false, every due item held, R among their reasons."""
+
+    def setUp(self):
+        super().setUp()
+        self.setup_owner()
+
+    def set_last_send(self, ago_s: float):
+        c = self.db()
+        c.execute("INSERT INTO kv(k,v) VALUES('last_send',?) ON CONFLICT(k) DO UPDATE SET "
+                  "v=excluded.v", (str(time.time() - ago_s),))
+        c.commit()
+
+    def mute(self, why: str):
+        ts = time.time() - 86400
+        c = self.db()
+        c.execute("INSERT INTO followups(key,kind,why,subject,status,sent_at,revisit_at,outcome)"
+                  " VALUES(?,?,?,?,?,?,?,?)", (f"m-{why}-{ts}", "k", why, "s", "closed", ts,
+                                               ts + 86400, "annoyed"))
+        c.commit()
+
+    def check(self) -> str:
+        """Run wake and digest on the current state and assert they agree."""
+        line = self.wake()
+        d = json.loads(self.fu("digest").stdout)
+        due = [f for f in d["followups"] if f["due"]]
+        free = sorted(f["id"] for f in due if not f["held"])
+        reasons = {f["held_reason"] for f in due if f["held"]}
+        if line.startswith("review ids "):
+            self.assertTrue(d["may_send"], (line, d))
+            self.assertEqual(d["mode"], "review")
+            self.assertEqual(line, "review ids " + ",".join(map(str, free)))
+        elif line.startswith("held "):
+            self.assertFalse(d["may_send"], (line, d))
+            self.assertNotEqual(d["mode"], "review")
+            self.assertTrue(due and not free, (line, d))
+            self.assertIn(line[len("held "):], reasons)
+        elif line == "capture":
+            self.assertFalse(d["may_send"], (line, d))
+            self.assertEqual(free, [])
+        else:
+            self.assertEqual(line, "quiet")
+            self.assertFalse(d["may_send"], (line, d))
+            self.assertEqual(free, [])
+            self.assertEqual(d["mode"], "quiet")
+        # And the other direction: may_send=true only ever pairs with a review line.
+        self.assertEqual(d["may_send"], line.startswith("review ids "), (line, d))
+        return line
+
+    def test_nothing(self):
+        self.assertEqual(self.check(), "quiet")
+
+    def test_not_yet_due(self):
+        self.add("later", revisit="+5h")
+        self.assertEqual(self.check(), "quiet")
+
+    def test_due(self):
+        a, b = self.add("a"), self.add("b", why="utility")
+        self.add("later", revisit="+5h")
+        self.assertEqual(self.check(), f"review ids {a},{b}")
+
+    def test_cooling(self):
+        self.add("a")
+        self.set_last_send(10 * 60)
+        self.assertEqual(self.check(), "held cooling")
+        self.set_last_send(91 * 60)
+        self.assertTrue(self.check().startswith("review ids "))
+
+    def test_muted_partial_then_full(self):
+        self.add("c", why="care")
+        u = self.add("u", why="utility")
+        self.mute("care")
+        self.assertEqual(self.check(), f"review ids {u}")
+        self.mute("utility")
+        self.assertEqual(self.check(), "held muted")
+
+    def test_cooling_and_muted_mixed(self):
+        self.add("c", why="care")
+        self.add("u", why="utility")
+        self.mute("care")
+        self.set_last_send(10 * 60)
+        self.assertEqual(self.check(), "held cooling")
+
+    def test_night(self):
+        self.add("a")
+        tz = tz_at_hour(23)
+        self.fu("setup", "--timezone", tz)
+        line = self.check()
+        if local_hour(tz) == 23:  # else the hour rolled over mid-test; check() still held
+            self.assertEqual(line, "held night")
+
+    def test_already_sent_is_not_due(self):
+        fid = self.add("a")
+        c = self.db()
+        now = time.time()
+        c.execute("UPDATE followups SET sent_at=?, sent_msg_id='m-1', revisit_at=? WHERE id=?",
+                  (now, now + 86400, fid))
+        c.commit()
+        self.assertEqual(self.check(), "quiet")
+
+    def test_capture_while_held(self):
+        self.add("a")
+        self.set_last_send(10 * 60)
+        now = time.time()
+        c = self.db()
+        c.execute("INSERT INTO kv(k,v) VALUES('last_capture',?)", (str(now - 3 * 3600),))
+        c.execute("INSERT INTO watermark(surface,last_ts) VALUES('messages',?)", (now - 3600,))
+        c.commit()
+        self.state_db([(now - 30, "user", "new message", OWNER)])
+        self.assertEqual(self.check(), "capture")

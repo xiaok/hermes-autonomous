@@ -44,7 +44,7 @@ Giving advice ≠ caring; a care item defaults to a greeting + one specific deta
 | cooldown | <90 minutes since the last send | message not sent |
 | due | `revisit_at <= now` and `sent_at < revisit_at` | only then counts as due |
 | no change | no new information compared to the last discussion | silent only |
-| cap | ≤3 items, ≤6 lines | truncated |
+| cap | ≤3 items, ≤6 lines | message refused, not sent (never truncated) |
 
 ## Offline evaluation mode (important)
 
@@ -58,7 +58,7 @@ When running scenarios with `scripts/decide.py` you **have no tools**: weather, 
 
 ```json
 {
-  "new_followups": [{"key":"throat-1030","why":"care","subject":"sore throat","quote":"…","revisit_at":"+12h"}],
+  "new_followups": [{"key":"throat-1030","kind":"health","why":"care","subject":"sore throat","quote":"…","revisit_at":"+12h"}],
   "decisions": [{"id":3,"action":"act_report","reason":"…","score":{"relevance":2,"change":1,"action":1,"timing":2,"risk":0}}],
   "message": "💊 …",
   "silent_actions": ["checked the weather, no rain tomorrow, didn't send"]

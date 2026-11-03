@@ -23,10 +23,28 @@
 
 ```
 [0] 记账   读自上次水位以来的对话 → 更新 followups 表（不出声）
-[1] 复盘   09:00 / 19:00 → 取 due 的，查证据
+[1] 复盘   有到期跟进点且门控放行时被唤醒 → 取 due 的，查证据
 [2] 判断   两条独立评分线 → 静默 / 做完再报 / 先问
-[3] 学习   记录结果；每周把猜错的案例写成 playbook 规则
+[3] 学习   记录 outcome；被嫌烦/被忽略的类别自动静音
 ```
+
+## 门控在代码里，prompt 只管判断与措辞
+
+能不能发、发多少，不靠模型自觉。`followups.py` 里的 `send_gate()` 是唯一的判定，wake、digest、
+send 三处都调用它，谁也不自己再算一遍夜间 / 冷却 / 静音：
+
+- **夜间**：本地（`settings.timezone`，缺省系统时区）23:00–08:00
+- **冷却**：距 `kv.last_send` 不足 90 分钟
+- **静音**：`muted_whys()`——30 天内已发出的跟进点里，同一 `why` 有 1 次 `annoyed` 或 3 次 `ignored`
+
+`followups.py send --ids …` 是私聊的**唯一出口**：先过 `send_gate`，再检查每个 id 存在、active、
+真的 due（发过且未重新到期的不算），最后检查 ≤3 个 id、正文非空、≤6 个非空行。任何一条不过就以
+rc=2 拒绝（`refused=night|cooling|muted|not_due|too_many_ids|too_many_lines|…`），**不发送、不截断**，
+这一轮就不发消息。通过后调用 `hermes send`，拿到 message_id 才算送达，并在同一把锁内立即记账
+（`sent_at` / `sends` / `sent_text` / `revisit_at = now+24h` / `kv.last_send`），不等 `apply`。
+
+`prompts/review.md` 只负责：判断哪些 due 的值得说、怎么措辞、记录 outcome，以及用一次 `apply`
+把本轮写回。prompt 里写的上限只是提示，真正的上限在 `send` 里。
 
 ### [1] 判断：两条线，各自独立
 
@@ -44,22 +62,40 @@
 
 ### [3] 学习
 
-- 每条发出的跟进点记 outcome：采纳 / 忽略 / 嫌烦 / 事后无用
-- 同类被忽略 3 次 → 该类降为静默；被明确嫌烦 1 次 → 该类以后先问
-- 每周把**猜错的案例**（发了被无视、该发没发）写成规则，进 `playbook.md`，带版本号可回滚
-- 规则只有在重复命中后才晋升 —— 和 skill 的演进方式一致
+- 每次复盘开始时，agent 看 48 小时内发出的跟进点之后主人的反应，经 `apply` 的 `outcomes` 记成
+  `accepted` / `ignored` / `annoyed` / `useless` / `unknown`
+- 30 天内已发出的跟进点：同一类别（`why`）被 `ignored` 3 次或 `annoyed` 1 次 → 整个类别静音
+  （到期也不唤醒 review，digest 标 `held_reason=muted`，`send` 拒绝）；超过 30 天的反馈不再计入
+- 静音只看已记录的 outcome：agent 没写 outcome，就不会静音；`useless` / `unknown` 不计入
+- 未实现（只是方向）：把猜错的案例沉淀成可回滚的 playbook 规则
 
 ## 运行形态
 
-- **复盘**：事件驱动。一个 Hermes cron job 每 15 分钟（`*/15 * * * *`）先跑门卫 `scripts/wake.py`
-  （不调模型）：没事就输出常量 `quiet`，输出与上次相同时 cron 的 monitor 直接跳过 agent；
-  有到期跟进点（且不在 90 分钟冷却 / 夜间）→ review，距上次 capture ≥2 小时且有新消息 → capture
-- **输入**：`scripts/followups.py digest`（自上次水位的消息 + 现行跟进点）
-- **提示词**：`prompts/review.md`
-- **产品输出**：`hermes send --to "$(followups.py dm-target)"`（私聊，≤1 条/次，≤3 项）
-- **开发输出**：cron 的最终回复 → 本话题（测试阶段额外要求：想了什么、做了什么、没发什么、存疑什么）
-- **预算**：每条最多 3 次只读查询；整个 run 5 分钟内
-- **静默**：23:00–08:00 不发私聊（复盘照跑，攒到早上）
+三步：**每 15 分钟门卫 → monitor 抑制 → send 记账**。
+
+1. **门卫**：一个 Hermes cron job 每 15 分钟（`*/15 * * * *`）先跑 `--monitor-script followup-wake.py`
+   （即 `scripts/wake.py`，不调模型），打印**一行**状态：
+
+   | 输出 | 含义 |
+   |---|---|
+   | `quiet` | 没有到期跟进点，也不需要 capture |
+   | `capture` | 没有可发的，但距上次 capture ≥2 小时且主人有 ≥1 条新消息：只记账，不发私聊 |
+   | `review ids 12,15` | 这些到期跟进点现在可以发（id 升序）；对应 digest 的 `may_send=true` |
+   | `held night\|cooling\|muted` | 有到期的，但全部被门控压住（多种原因时按 night > cooling > muted 取一个）；对应 `may_send=false` |
+   | `{"mode": "setup-needed"}` | 还没配置 owner |
+
+   优先级：`review` > `capture` > `held` > `quiet`。
+2. **monitor 抑制**：cron 的 monitor 对门卫的输出**按字节做哈希**，与上次相同就不唤醒 agent。所以每个
+   状态的输出必须字节稳定：不带时间戳、计数或会变的顺序。`held …` 只写原因、不写 id，压住期间就一直
+   是同一行，不会每 15 分钟叫醒一次；状态真的变了（冷却结束、到了早上、新到期一项）输出才变。
+3. **send 记账**：被唤醒后，`--script followup-digest.py` 先把 `followups.py digest` 的 JSON 交给 agent
+   （`mode` / `may_send` / `held_reason` 与门卫读的是同一个 `send_gate`）。agent 按 `prompts/review.md`
+   判断，要发就调 `followups.py send`（见上节：唯一出口，拒绝即不发，通过即记账），最后用一次
+   `followups.py apply` 写回新跟进点、decisions、outcomes 和水位。
+
+- **投递**：job 用 `--deliver local`，正常 run 的最终回复不进聊天；只有 job 失败才 `--failure-deliver origin`
+- **开发输出**：`setup --dev-log` 打开后，最终回复是一段开发日志；默认 `[SILENT]`
+- **夜间**：23:00–08:00 门卫输出 `held night`（或 `capture`），`send` 拒绝；到期的攒到早上
 
 ## 数据
 
@@ -67,8 +103,10 @@
 
 ```
 followups(id, key, kind, why, subject, quote, hint, revisit_at,
-          status, checks, last_checked, note, created_at)
+          status, checks, last_checked, note, created_at,
+          sent_at, sent_msg_id, outcome, sends, sent_text)
 watermark(surface, last_ts)
+kv(k, v)              -- last_send（冷却起点）、last_capture（capture 节奏）
 log(id, run_at, kind, payload)
 ```
 

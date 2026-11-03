@@ -84,9 +84,11 @@ python3 $PLUGIN/scripts/followups.py doctor --fix
 | 到期 | 这件事**现在**值得回看，不是固定早上九点的摘要 |
 | 变化 | 跟上次讨论相比有新信息；重复不算跟进 |
 | 有据 | 引得出你当时的原话；没原话不发 |
-| 配额 | 每次唤醒 ≤1 条、≤3 项、90 分钟冷却、23:00–08:00 静默 |
+| 配额 | 每条消息 ≤3 项、≤6 行，90 分钟冷却，23:00–08:00 静默 |
 
-它不会变成噪音的核心原因：**沉默是一个被计分的结果**。被忽略的跟进点会自己降级；同一类你摆手三次，它就不再开口。
+前三条是 agent 按规则做的判断；最后一条由代码强制：所有私聊都只经 `followups.py send` 发出，它在夜间、冷却期内、超过 3 项或超过 6 行时直接拒绝。被拒绝时消息不会发出、也不会被截短——这一轮就此结束、不发消息。冷却也意味着每次唤醒最多一条。
+
+它不会变成噪音的核心原因：**你的反应会被回写**。每次复盘开始时，agent 先把你对最近 48 小时内发出的跟进点的反应记成 outcome（`accepted` / `ignored` / `annoyed` / `useless`）。30 天内，已发出的跟进点里同一类别（`care` / `utility` / `risk` / `curiosity`）出现 1 次 `annoyed` 或 3 次 `ignored`，整个类别就被静音：它到期的跟进点不再唤醒复盘，digest 里标成 held，`send` 也会拒绝。静音的前提是这些 outcome 被记录下来；`followups.py why` 可以看到哪些类别被静音。
 
 ## 两种价值（大多数助手漏掉的那一半）
 
@@ -108,6 +110,8 @@ python3 $PLUGIN/scripts/followups.py doctor --fix
   `python3 scripts/decide.py --scenario scenarios/01-throat.json`
 - [`docs/DECIDER.md`](docs/DECIDER.md) —— 输入、闸门、输出结构。
 
+`scenarios/` 里的对话都是虚构示例，不对应任何真实用户。
+
 ## 你的数据
 
 - 只读属于**你的 user id** 的会话，默认只读你和 Hermes 的私聊：你发的消息加 Hermes 的回复。群聊、**话题（thread）**、**论坛话题（forum）**和**频道（channel）**默认不读——Hermes 把 Discord/Slack 的话题会话记成 `chat_type='thread'`、Telegram 论坛群的话题记成 `chat_type='forum'`，频道记成 `chat_type='channel'`，它们和群聊一样可能有多人发言（Telegram 私聊里的话题仍按 `dm` 记录）；`followups.py setup --include-groups` 打开后，群聊、话题、论坛话题与频道会话会整段读入——包括其他人说的话。
@@ -116,15 +120,21 @@ python3 $PLUGIN/scripts/followups.py doctor --fix
 
 ## 它碰了什么（披露）
 
-- **读**：Hermes 的会话库 `~/.hermes/state.db`，只读，且只读属于你 user id 的会话：私聊里的用户与助手消息；群聊、话题（thread）、论坛话题（forum）与频道（channel）会话（含其他成员的消息）仅在打开 `include_groups` 后读取。不读其他文件。
-- **写**：只有自己的数据目录 `~/.hermes/plugin-data/hermes-autonomous/`（SQLite 跟进表 + `settings.json`，权限 0600）。
+- **读**：Hermes 的会话库 `~/.hermes/state.db`，只读，且只读属于你 user id 的会话：私聊里的用户与助手消息；群聊、话题（thread）、论坛话题（forum）与频道（channel）会话（含其他成员的消息）仅在打开 `include_groups` 后读取。
+- **读**：运行 `doctor` 时（`setup` 结束时也会跑一次）只读 Hermes 的定时任务库 `~/.hermes/cron/jobs.json`，用来找到本插件的 job；读不了时退回 `hermes cron list`。除此之外只读自己的配置。
+- **写**：自己的数据目录 `~/.hermes/plugin-data/hermes-autonomous/`（SQLite 跟进表 + `settings.json`，权限 0600；另有一个 `send.lock` 文件）。
+- **拷贝**：安装时把两个 cron 脚本（`cron/followup-wake.py`、`cron/followup-digest.py`）复制到 `~/.hermes/scripts/`——由 agent 完成，或你按上面的 `cp` 手动做。job 的 `--script` / `--monitor-script` 就是在这个目录里找的。
+- **改自己的 cron job**：`doctor --fix` 会对它认出是本插件的那个 job 执行 `hermes cron edit <id> --monitor-script … --deliver local --failure-deliver origin`。不碰别的 job，不删除、不重建；不带 `--fix` 只报告。
 - **网络**：插件代码本身不发任何请求。复盘时 agent 可能用 Hermes 自带工具查天气/价格/新闻——那是 Hermes 的流量，不是这个插件的。
-- **Shell**：`/followups` 只用 `sys.executable` 跑一个本地 Python 脚本；cron 那侧也是纯 Python。唯一会起 `hermes` 子进程的是 `doctor`（`setup` 结束时也会跑一次）：`hermes cron list`，加 `--fix` 时再对本插件自己的 job 跑 `hermes cron edit`。复盘时 agent 会用它的终端工具执行本插件的 helper（`followups.py digest`、`followups.py apply` 等），并用 `hermes send` 把消息发到你的私聊。离线工具 `scripts/decide.py` 会调用 `hermes -z` 跑一次无工具的模型调用——仅当你主动运行它时。不注册 hook、没有后台线程、不绕过审批。
+- **Shell**：`/followups` 只用 `sys.executable` 跑一个本地 Python 脚本；cron 那侧也是纯 Python。`followups.py` 只在两处起 `hermes` 子进程：`doctor`（上面说的 `hermes cron list` 兜底，加 `--fix` 时的 `hermes cron edit`），以及 `followups.py send`——门控通过后由它调用 `hermes send` 把消息发到你的私聊。复盘时 agent 会用它的终端工具执行本插件的 helper（`followups.py digest`、`followups.py send`、`followups.py apply` 等）。离线工具 `scripts/decide.py` 会调用 `hermes -z` 跑一次无工具的模型调用——仅当你主动运行它时。不注册 hook、没有后台线程、不绕过审批。
 - **凭据**：没有。Telegram id 存在插件自己的 `settings.json`（0600），不读 `.env`、`auth.json` 或钥匙串。
 - 无遥测、无统计上报。
 
 ## 文档
 
-[English](README.md) · [设计](docs/DESIGN.md) · [调研](docs/RESEARCH.md) · [判断规范](docs/DECIDER.md)
+[English](README.md) · [设计](docs/DESIGN.md)（中文） · [调研](docs/RESEARCH.md)（中文） ·
+[判断规范](docs/DECIDER.md)（中文） · [产品拆解](docs/teardown.md)（中文）
+
+已在 Hermes Agent 0.22.2 上验证（`requires_hermes: ">=0.22.2"`）。
 
 MIT。

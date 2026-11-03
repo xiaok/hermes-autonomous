@@ -30,9 +30,12 @@ FOLLOWUPS = ROOT / "scripts" / "followups.py"
 WAKE = ROOT / "scripts" / "wake.py"
 OWNER = "4242"
 CJK = re.compile(r"[一-鿿]")
+WM0 = time.time() - 3600  # a realistic cursor: recent enough for the fresh-board floor
 
 # Stand-in for the `hermes` CLI: `cron list [--json]` and `cron edit` over a
-# jobs.json next to it; every call is appended to calls.jsonl.
+# jobs.json next to it, and `send`, which answers with send_reply.json (default:
+# a delivered message) and logs its stdin body to sends.jsonl; every call is
+# appended to calls.jsonl.
 FAKE_HERMES = '''#!{python}
 import json, sys
 from pathlib import Path
@@ -40,6 +43,15 @@ here = Path(__file__).resolve().parent
 args = sys.argv[1:]
 with open(here / "calls.jsonl", "a") as f:
     f.write(json.dumps(args) + "\\n")
+if args[:1] == ["send"]:
+    body = sys.stdin.read() if args[-2:] == ["--file", "-"] else None
+    with open(here / "sends.jsonl", "a") as f:
+        f.write(json.dumps({{"args": args, "body": body}}) + "\\n")
+    reply = here / "send_reply.json"
+    doc = json.loads(reply.read_text()) if reply.exists() else {{
+        "success": True, "message_id": "m-1", "mirrored": True}}
+    print(json.dumps(doc, indent=2))
+    sys.exit(0 if doc.get("success") and not doc.get("error") else 1)
 jobs = json.loads((here / "jobs.json").read_text())
 if args[:2] == ["cron", "list"]:
     print(json.dumps(jobs) if "--json" in args else "(text)")
@@ -85,6 +97,15 @@ class Home(unittest.TestCase):
     def setUp(self):
         self.home = Path(tempfile.mkdtemp(prefix="hermes-home-"))
         self.addCleanup(shutil.rmtree, self.home, True)
+        # The suite may itself run inside a Hermes chat session: its HERMES_SESSION_*
+        # would make /followups think a (non-owner) chat user is calling.
+        session = mock.patch.dict(os.environ, {k: v for k, v in os.environ.items()
+                                               if not k.startswith("HERMES_SESSION_")}, clear=True)
+        session.start()
+        self.addCleanup(session.stop)
+        gateway = mock.patch.dict(sys.modules, {"gateway": None, "gateway.session_context": None})
+        gateway.start()
+        self.addCleanup(gateway.stop)
         self.env = {k: v for k, v in os.environ.items()
                     if not k.startswith("AUTONOMY_") and k != "HERMES_HOME"}
         self.env["HERMES_HOME"] = str(self.home)
@@ -184,7 +205,7 @@ class FreshInstall(Home):
                   "due_count", "mode", "night", "muted", "dev_log"):
             self.assertIn(k, d)
         self.assertEqual(d["messages"], [])
-        self.assertEqual(d["mode"], "capture")
+        self.assertEqual(d["mode"], "quiet")  # no messages, nothing due
         self.assertIs(d["night"], False)
         self.assertEqual(d["muted"], {})
         # No messages: next_watermark is the current (default) watermark, as a raw float.
@@ -222,7 +243,7 @@ class FreshInstall(Home):
         p = subprocess.run([sys.executable, str(ROOT / "cron" / "followup-digest.py")],
                            capture_output=True, text=True, env=env, cwd=self.home, timeout=30)
         self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
-        self.assertEqual(json.loads(p.stdout)["mode"], "capture")
+        self.assertEqual(json.loads(p.stdout)["mode"], "quiet")
 
 
 class Apply(Home):
@@ -337,7 +358,7 @@ class ApplyRollback(Home):
         super().setUp()
         self.setup_owner()
         self.fid = self.add("existing")
-        self.apply({"watermark": 1000.0})
+        self.apply({"watermark": WM0})
         self.before = self.snapshot()
 
     def assert_rejected(self, doc: dict, needle: str):
@@ -415,10 +436,11 @@ class ApplyRollback(Home):
 
     def test_file_flag(self):
         f = self.home / "run.json"
-        f.write_text(json.dumps({"watermark": 3000.5}), encoding="utf-8")
+        wm = round(time.time(), 3)
+        f.write_text(json.dumps({"watermark": wm}), encoding="utf-8")
         self.fu("apply", "--file", str(f))
         got = self.db().execute("SELECT last_ts FROM watermark").fetchone()[0]
-        self.assertEqual(got, 3000.5)
+        self.assertEqual(got, wm)
 
 
 class WakeMuted(Home):
@@ -437,7 +459,9 @@ class WakeMuted(Home):
 
     def woke_ids(self) -> list[int]:
         out = self.wake()
-        return [] if out == "quiet" else json.loads(out)["ids"]
+        if not out.startswith("review ids "):
+            return []
+        return [int(i) for i in out[len("review ids "):].split(",")]
 
     def test_annoyed_mutes_its_category_only(self):
         care, util = self.add("care-due", "care"), self.add("util-due", "utility")
@@ -453,7 +477,7 @@ class WakeMuted(Home):
         self.past("risk", "ignored")
         self.assertEqual(self.woke_ids(), [risk])
         self.past("risk", "ignored")
-        self.assertEqual(self.wake(), "quiet")
+        self.assertEqual(self.wake(), "held muted")
         self.assertEqual(json.loads(self.fu("digest").stdout)["muted"], {"risk": "ignored*3"})
 
     def test_feedback_older_than_30_days_expires(self):
@@ -461,10 +485,10 @@ class WakeMuted(Home):
         self.past("care", "annoyed", days_ago=31)
         self.assertEqual(self.woke_ids(), [care])
 
-    def test_all_muted_is_quiet(self):
+    def test_all_muted_is_held_muted(self):
         self.add("care-due", "care")
         self.past("care", "annoyed")
-        self.assertEqual(self.wake(), "quiet")
+        self.assertEqual(self.wake(), "held muted")
 
 
 class DevLog(Home):
@@ -578,7 +602,7 @@ class IncludeGroups(Home):
         self.assertEqual(self.wake(), "quiet")  # forum topics are off by default
         self.fu("setup", "--include-groups")
         woke = self.wake()
-        self.assertIn('"capture"', woke, f"a forum message did not wake the gate: {woke!r}")
+        self.assertEqual(woke, "capture", f"a forum message did not wake the gate: {woke!r}")
 
     def test_include_groups_reads_threads_too(self):
         """Threads are group-like (several members can post), so include_groups covers them."""
@@ -600,7 +624,7 @@ class IncludeGroups(Home):
         self.assertEqual(self.wake(), "quiet")  # groups and threads are off by default
         self.fu("setup", "--include-groups")
         woke = self.wake()
-        self.assertIn('"capture"', woke, f"a thread message did not wake the gate: {woke!r}")
+        self.assertEqual(woke, "capture", f"a thread message did not wake the gate: {woke!r}")
 
     def test_wake_counts_only_what_digest_reads(self):
         c = self.db()
@@ -612,7 +636,7 @@ class IncludeGroups(Home):
         sc.close()
         self.assertEqual(self.wake(), "quiet")  # only a group message: not read by default
         self.fu("setup", "--include-groups")
-        self.assertEqual(json.loads(self.wake())["mode"], "capture")
+        self.assertEqual(self.wake(), "capture")
 
 
 class CaptureCadence(Home):
@@ -633,7 +657,7 @@ class CaptureCadence(Home):
 
     def test_fresh_watermark_old_capture_wakes(self):
         self.state(watermark=self.now - 60, last_capture=self.now - 3 * 3600)
-        self.assertEqual(json.loads(self.wake())["mode"], "capture")
+        self.assertEqual(self.wake(), "capture")
 
     def test_old_watermark_recent_capture_stays_quiet(self):
         self.state(watermark=self.now - 5 * 3600, last_capture=self.now - 60)
@@ -641,7 +665,7 @@ class CaptureCadence(Home):
 
     def test_old_db_without_last_capture_falls_back_to_watermark(self):
         self.state(watermark=self.now - 3 * 3600, last_capture=None)
-        self.assertEqual(json.loads(self.wake())["mode"], "capture")
+        self.assertEqual(self.wake(), "capture")
 
     def test_apply_does_not_rearm_capture(self):
         # apply moves the watermark to the last message but stamps last_capture = now.
@@ -695,7 +719,7 @@ class ReadOnlyCommands(Home):
 
 class WakeHold(Home):
     """Due items must never become a review at night or inside the send cooldown:
-    the gate says capture (if there is something to capture) or quiet."""
+    the gate says capture (if there is something to capture) or a constant held line."""
 
     def setUp(self):
         super().setUp()
@@ -728,7 +752,7 @@ class WakeHold(Home):
             with self.subTest(hour=hour):
                 out = self.at_hour(hour)
                 if out is not None:
-                    self.assertEqual(out, "quiet")
+                    self.assertEqual(out, "held night")
 
     def test_night_with_capture_wakes_capture_only(self):
         self.arm_capture()
@@ -736,7 +760,7 @@ class WakeHold(Home):
             with self.subTest(hour=hour):
                 out = self.at_hour(hour)
                 if out is not None:
-                    self.assertEqual(json.loads(out), {"mode": "capture", "night": True})
+                    self.assertEqual(out, "capture")
 
     def test_day_edges_do_review(self):
         # Control: the same state at 08:xx and 22:xx is a review, so the holds above
@@ -745,23 +769,22 @@ class WakeHold(Home):
             with self.subTest(hour=hour):
                 out = self.at_hour(hour)
                 if out is not None:
-                    self.assertEqual(json.loads(out),
-                                     {"mode": "review", "ids": [self.due], "night": False})
+                    self.assertEqual(out, f"review ids {self.due}")
 
     def test_cooldown_holds_review(self):
         self.set_last_send(30 * 60)
-        self.assertEqual(self.wake(), "quiet")
+        self.assertEqual(self.wake(), "held cooling")
         self.set_last_send(89 * 60)
-        self.assertEqual(self.wake(), "quiet")
+        self.assertEqual(self.wake(), "held cooling")
 
     def test_cooldown_with_capture_wakes_capture_only(self):
         self.set_last_send(30 * 60)
         self.arm_capture()
-        self.assertEqual(json.loads(self.wake()), {"mode": "capture", "night": False})
+        self.assertEqual(self.wake(), "capture")
 
     def test_cooldown_over_reviews(self):
         self.set_last_send(91 * 60)
-        self.assertEqual(json.loads(self.wake())["mode"], "review")
+        self.assertEqual(self.wake(), f"review ids {self.due}")
 
 
 class PromptContract(Home):
@@ -794,24 +817,28 @@ class PromptContract(Home):
         doc = self.example_doc()
         # Guard the extraction itself: it must be the full example, not a fragment.
         self.assertTrue({"new_followups", "decisions", "sent", "watermark"} <= set(doc), doc)
+        # `followups.py send` records the DM itself; apply must not be taught to book it again.
+        self.assertIsNone(doc["sent"])
+        # act_report / ask ids were delivered by `followups.py send` before apply runs.
+        c = self.db()
+        for d in doc["decisions"]:
+            if d["action"] != "silent":
+                c.execute("UPDATE followups SET sent_msg_id='m-0', sent_at=? WHERE id=?",
+                          (time.time(), d["id"]))
+        c.commit()
         out = self.apply(doc)
         self.assertTrue(out["ok"], out)
         c = self.db()
         self.assertIsNotNone(c.execute(
             "SELECT 1 FROM followups WHERE key=?", (doc["new_followups"][0]["key"],)).fetchone())
-        self.assertEqual(self.row(doc["sent"]["id"])["sent_msg_id"], doc["sent"]["msg_id"])
-        # The example teaches the agent to pass the sent text back.
-        self.assertTrue(doc["sent"].get("text"), doc["sent"])
-        self.assertEqual(self.row(doc["sent"]["id"])["sent_text"], doc["sent"]["text"])
-        self.assertEqual(self.row(doc["sent"]["id"])["sends"], 1)
         got = c.execute("SELECT last_ts FROM watermark WHERE surface='messages'").fetchone()[0]
         self.assertEqual(got, doc["watermark"])
 
     def test_sent_variants_apply(self):
-        # §4: single id and several ids in one message (msg_id "<mid>" is a shell
-        # placeholder but a valid non-empty string).
+        # §4: the exit-4 fallback receipt (msg_id "<msg_id>" is a placeholder but a
+        # valid non-empty string).
         snippets = self.inline_snippets('"sent": {')
-        self.assertGreaterEqual(len(snippets), 2, snippets)
+        self.assertGreaterEqual(len(snippets), 1, snippets)
         for s in snippets:
             with self.subTest(s=s):
                 doc = json.loads("{" + s + ', "watermark": 1.0}')
@@ -1285,3 +1312,543 @@ class ReadmeDisclosure(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class Send(Home):
+    """`followups.py send`: the send gate and the receipt live in code, not in the prompt."""
+
+    BODY = "☔ Tokyo tomorrow: rain\nTake an umbrella\n"
+
+    def setUp(self):
+        super().setUp()
+        self.setup_owner()
+        self.a = self.add("trip", why="utility")
+        self.b = self.add("throat", why="care")
+
+    def send(self, ids, body: str | None = None, rc: int = 0) -> dict:
+        p = self.run_cli(FOLLOWUPS, "send", "--ids", ",".join(str(i) for i in ids),
+                         stdin=self.BODY if body is None else body)
+        self.assertEqual(p.returncode, rc, p.stdout + p.stderr)
+        return json.loads(p.stdout)
+
+    def sends(self) -> list[dict]:
+        f = self.bin / "sends.jsonl"
+        return [json.loads(l) for l in f.read_text().splitlines()] if f.exists() else []
+
+    def kv(self) -> dict:
+        return {r["k"]: float(r["v"]) for r in self.db().execute("SELECT * FROM kv")}
+
+    def set_last_send(self, ago_s: float):
+        c = self.db()
+        c.execute("INSERT INTO kv(k,v) VALUES('last_send',?) ON CONFLICT(k) DO UPDATE SET "
+                  "v=excluded.v", (str(time.time() - ago_s),))
+        c.commit()
+
+    def assert_refused(self, ids, reason: str, body: str | None = None):
+        before = self.snapshot()
+        out = self.send(ids, body, rc=2)
+        self.assertEqual((out["ok"], out["refused"]), (False, reason), out)
+        self.assertEqual(self.sends(), [], "hermes send must not be called")
+        self.assertEqual(self.snapshot(), before)
+
+    def test_send_records_immediately_without_apply(self):
+        t0 = time.time()
+        out = self.send([self.b, self.a])
+        self.assertEqual(out, {"ok": True, "msg_id": "m-1", "ids": [self.b, self.a], "sent": 2})
+        # argv list straight to hermes, body on stdin, stripped.
+        [call] = self.sends()
+        self.assertEqual(call["args"], ["send", "--to", f"telegram:{OWNER}", "--json",
+                                        "--file", "-"])
+        self.assertEqual(call["body"], self.BODY.strip())
+        for fid in (self.a, self.b):
+            r = self.row(fid)
+            self.assertEqual((r["sends"], r["checks"], r["sent_msg_id"], r["sent_text"]),
+                             (1, 1, "m-1", self.BODY.strip()))
+            self.assertAlmostEqual(r["sent_at"], t0, delta=30)
+            self.assertAlmostEqual(r["revisit_at"], r["sent_at"] + 86400, delta=0.001)
+        self.assertAlmostEqual(self.kv()["last_send"], self.row(self.a)["sent_at"], delta=0.001)
+        # No apply ever ran: the log is empty and the receipt stands on its own.
+        self.assertEqual(self.db().execute("SELECT COUNT(*) FROM log").fetchone()[0], 0)
+
+    def test_body_is_never_shell_interpreted(self):
+        body = 'it\'s "$HOME" `id` $(rm -rf /) ; echo hi'
+        self.send([self.a], body)
+        self.assertEqual(self.sends()[0]["body"], body)
+        self.assertEqual(self.row(self.a)["sent_text"], body)
+
+    def test_cooling_refused(self):
+        self.set_last_send(30 * 60)
+        self.assert_refused([self.a], "cooling")
+
+    def test_night_refused(self):
+        tz = tz_at_hour(3)
+        self.fu("setup", "--timezone", tz)
+        if local_hour(tz) == 3:  # the hour did not roll over mid-test
+            self.assert_refused([self.a], "night")
+
+    def test_muted_category_refused(self):
+        c = self.db()
+        ts = time.time() - 86400
+        c.execute("INSERT INTO followups(key,kind,why,subject,status,sent_at,revisit_at,outcome)"
+                  " VALUES('old','k','care','s','closed',?,?,'annoyed')", (ts, ts + 86400))
+        c.commit()
+        self.assert_refused([self.a, self.b], "muted")
+        self.send([self.a])  # the other category still goes out
+
+    def test_four_ids_refused(self):
+        more = [self.add(f"x{i}", why="utility") for i in range(2)]
+        self.assert_refused([self.a, self.b, *more], "too_many_ids")
+
+    def test_seven_lines_refused_not_truncated(self):
+        self.assert_refused([self.a], "too_many_lines", "\n".join(f"line {i}" for i in range(7)))
+        # Six lines with blank separators is fine.
+        self.send([self.a], "\n\n".join(f"line {i}" for i in range(6)))
+
+    def test_empty_body_refused(self):
+        self.assert_refused([self.a], "empty_text", "  \n\n ")
+
+    def test_item_state_refused(self):
+        later = self.add("later", revisit="+5h")
+        self.assert_refused([later], "not_due")
+        self.assert_refused([999], "not_found")
+        self.apply({"close": [{"id": self.b}], "watermark": 1.0})
+        self.assert_refused([self.b], "not_active")
+        self.assert_refused([self.a, self.a], "bad_ids")
+
+    def test_no_message_id_is_a_failure_and_writes_nothing(self):
+        for reply in ({"success": True, "message_id": None},
+                      {"success": True, "message_id": "None"},
+                      {"success": True},
+                      {"success": True, "skipped": True, "reason": "cron_auto_delivery_duplicate_target"},
+                      {"success": False, "error": "chat not found"}):
+            with self.subTest(reply=reply):
+                (self.bin / "send_reply.json").write_text(json.dumps(reply))
+                before = self.snapshot()
+                out = self.send([self.a], rc=3)
+                self.assertFalse(out["ok"])
+                self.assertEqual(self.snapshot(), before)
+        self.assertEqual(len(self.sends()), 5)  # it was tried, and nothing was booked
+
+    def test_repeat_is_refused_not_resent(self):
+        self.send([self.a])
+        # Even with the cooldown out of the way, the same ids are no longer due.
+        self.set_last_send(3 * 3600)
+        out = self.send([self.a], rc=2)
+        self.assertEqual(out["refused"], "not_due")
+        self.assertEqual(len(self.sends()), 1)
+        self.assertEqual(self.row(self.a)["sends"], 1)
+
+    def test_apply_with_same_msg_id_is_not_counted_twice(self):
+        self.send([self.a, self.b])
+        sent_at = self.row(self.a)["sent_at"]
+        last_send = self.kv()["last_send"]
+        out = self.apply({"decisions": [{"id": self.a, "action": "act_report", "reason": "r"}],
+                          "sent": {"ids": [self.a, self.b], "msg_id": "m-1", "text": "x"},
+                          "watermark": 1.0})
+        self.assertEqual((out["sent"], out["already_recorded"]), ([], [self.a, self.b]))
+        for fid in (self.a, self.b):
+            r = self.row(fid)
+            self.assertEqual((r["sends"], r["checks"], r["sent_at"]), (1, 1, sent_at))
+        self.assertEqual(self.kv()["last_send"], last_send)
+        # A different msg_id is a different message: still booked (old prompts).
+        self.apply({"sent": {"id": self.a, "msg_id": "m-2", "text": "y"}, "watermark": 1.0})
+        self.assertEqual(self.row(self.a)["sends"], 2)
+
+
+class Gate(Home):
+    """digest and wake read one send gate; wake prints one constant line per state."""
+
+    def setUp(self):
+        super().setUp()
+        self.setup_owner()
+
+    def digest(self) -> dict:
+        return json.loads(self.fu("digest").stdout)
+
+    def item(self, d: dict, fid: int) -> dict:
+        return next(f for f in d["followups"] if f["id"] == fid)
+
+    def wake_twice(self) -> str:
+        a, b = self.run_cli(WAKE), self.run_cli(WAKE)
+        self.assertEqual(a.stdout.encode(), b.stdout.encode(), "wake must be byte-stable")
+        return a.stdout.strip()
+
+    def set_last_send(self, ago_s: float):
+        c = self.db()
+        c.execute("INSERT INTO kv(k,v) VALUES('last_send',?) ON CONFLICT(k) DO UPDATE SET "
+                  "v=excluded.v", (str(time.time() - ago_s),))
+        c.commit()
+
+    def mute(self, why: str):
+        ts = time.time() - 86400
+        c = self.db()
+        c.execute("INSERT INTO followups(key,kind,why,subject,status,sent_at,revisit_at,outcome)"
+                  " VALUES(?,?,?,?,?,?,?,?)", (f"m-{why}", "k", why, "s", "closed", ts,
+                                               ts + 86400, "annoyed"))
+        c.commit()
+
+    def test_quiet(self):
+        self.add("later", revisit="+5h")
+        d = self.digest()
+        self.assertEqual((d["mode"], d["may_send"], d["cooling"], d["night"]),
+                         ("quiet", False, False, False))
+        self.assertEqual(self.wake_twice(), "quiet")
+
+    def test_may_send(self):
+        b, a = self.add("b", why="utility"), self.add("a", why="care")
+        d = self.digest()
+        self.assertEqual((d["mode"], d["may_send"]), ("review", True))
+        for fid in (a, b):
+            self.assertEqual((self.item(d, fid)["held"], self.item(d, fid)["held_reason"]),
+                             (False, None))
+        self.assertEqual(self.wake_twice(), f"review ids {min(a, b)},{max(a, b)}")
+
+    def test_cooling(self):
+        fid = self.add("x")
+        self.set_last_send(10 * 60)
+        d = self.digest()
+        self.assertEqual((d["mode"], d["may_send"], d["cooling"]), ("quiet", False, True))
+        self.assertEqual((self.item(d, fid)["due"], self.item(d, fid)["held"],
+                          self.item(d, fid)["held_reason"]), (True, True, "cooling"))
+        self.assertEqual(self.wake_twice(), "held cooling")
+
+    def test_night(self):
+        fid = self.add("x")
+        tz = tz_at_hour(23)
+        self.fu("setup", "--timezone", tz)
+        d = self.digest()
+        out = self.wake_twice()
+        if local_hour(tz) != 23:
+            return  # the hour rolled over mid-test
+        self.assertEqual((d["mode"], d["may_send"], d["night"]), ("quiet", False, True))
+        self.assertEqual(self.item(d, fid)["held_reason"], "night")
+        self.assertEqual(out, "held night")
+
+    def test_muted_partial_and_full(self):
+        care, util = self.add("care", why="care"), self.add("util", why="utility")
+        self.mute("care")
+        d = self.digest()
+        self.assertTrue(d["may_send"])
+        self.assertEqual(self.item(d, care)["held_reason"], "muted")
+        self.assertFalse(self.item(d, util)["held"])
+        self.assertEqual(self.wake_twice(), f"review ids {util}")
+        self.mute("utility")
+        d = self.digest()
+        self.assertEqual((d["mode"], d["may_send"]), ("quiet", False))
+        self.assertEqual(self.wake_twice(), "held muted")
+
+    def test_no_sendable_item_when_may_send_false(self):
+        self.add("x")
+        self.add("y", why="utility")
+        self.set_last_send(5 * 60)
+        d = self.digest()
+        self.assertFalse(d["may_send"])
+        self.assertTrue(all(f["held"] for f in d["followups"] if f["due"]))
+
+    def test_capture_beats_hold_and_digest_mode_capture(self):
+        self.add("x")
+        self.set_last_send(10 * 60)
+        now = time.time()
+        c = self.db()
+        c.execute("INSERT INTO kv(k,v) VALUES('last_capture',?)", (str(now - 3 * 3600),))
+        c.execute("INSERT INTO watermark(surface,last_ts) VALUES('messages',?)", (now - 3600,))
+        c.commit()
+        self.state_db([(now - 30, "user", "new message", OWNER)])
+        self.assertEqual(self.digest()["mode"], "capture")
+        self.assertEqual(self.wake_twice(), "capture")
+
+    def test_wake_has_no_gate_of_its_own(self):
+        src = WAKE.read_text(encoding="utf-8")
+        for needle in ("SEND_COOLDOWN", "last_send", "muted_whys", ".hour"):
+            self.assertNotIn(needle, src)
+        self.assertIn("send_gate(", src)
+
+
+class PromptSend(unittest.TestCase):
+    TEXT = (ROOT / "prompts" / "review.md").read_text(encoding="utf-8")
+
+    def test_send_goes_through_the_helper(self):
+        s4 = self.TEXT.split("## 4.", 1)[1].split("## 5.", 1)[0]
+        self.assertIn("followups.py\" send --ids 12,15 <<'MSG'", s4)
+        self.assertNotIn("hermes send --to", self.TEXT)
+        self.assertIn("**Do not** work around it with your own `hermes send`", s4)
+        for gate in ("night", "cooldown", "muted", "at most 3 ids", "6 non-blank lines"):
+            self.assertIn(gate, s4)
+
+    def test_no_false_claim_about_state_db(self):
+        self.assertNotIn("not written to state.db", self.TEXT)
+        self.assertIn('"mirrored": true', self.TEXT)
+
+
+class OwnerOnlyCommand(Home):
+    """/followups shows quotes from the owner's private chats: owner only."""
+
+    def setUp(self):
+        super().setUp()
+        self.setup_owner()
+        self.plugin = load_plugin()
+        os.environ["HERMES_HOME"] = str(self.home)  # restored by Home's environ patch
+        self.calls = []
+
+    def fake_run(self, cmd, **kw):
+        self.calls.append(cmd)
+        return subprocess.CompletedProcess(cmd, 0, "ok", "")
+
+    def run_as(self, raw: str, user: str | None = None, chat: str | None = None,
+               via_gateway: bool = True) -> str:
+        vals = {k: v for k, v in (("HERMES_SESSION_USER_ID", user),
+                                  ("HERMES_SESSION_CHAT_TYPE", chat)) if v is not None}
+        if via_gateway:
+            ctx = types.SimpleNamespace(get_session_env=lambda n, d="": vals.get(n, d))
+            source = mock.patch.dict(sys.modules, {
+                "gateway": types.SimpleNamespace(session_context=ctx),
+                "gateway.session_context": ctx})
+        else:  # no gateway module: fall back to the process environment
+            source = mock.patch.dict(os.environ, vals)
+        with source, mock.patch.object(self.plugin.subprocess, "run", self.fake_run):
+            return self.plugin._followups_command(raw)
+
+    def test_non_owner_is_refused_and_nothing_runs(self):
+        for raw in ("list", "close 1", "doctor --fix"):
+            with self.subTest(raw=raw):
+                self.assertEqual(self.run_as(raw, user="9999", chat="dm"),
+                                 "This command is only available to the owner.")
+        self.assertEqual(self.calls, [])
+
+    def test_non_owner_refused_via_environ_fallback(self):
+        out = self.run_as("list", user="9999", chat="group", via_gateway=False)
+        self.assertEqual(out, "This command is only available to the owner.")
+        self.assertEqual(self.calls, [])
+
+    def test_owner_is_allowed(self):
+        self.assertEqual(self.run_as("list", user=OWNER, chat="dm"), "ok")
+        self.assertEqual(len(self.calls), 1)
+
+    def test_owner_allowed_via_environ_fallback(self):
+        self.assertEqual(self.run_as("list", user=OWNER, chat="dm", via_gateway=False), "ok")
+
+    def test_no_session_user_keeps_working(self):
+        self.assertEqual(self.run_as("list"), "ok")
+        self.assertEqual(self.run_as("list", via_gateway=False), "ok")
+        self.assertEqual(len(self.calls), 2)
+
+    def test_unconfigured_owner_refuses_a_chat_user(self):
+        (self.home / "plugin-data" / "hermes-autonomous" / "settings.json").unlink()
+        self.assertEqual(self.run_as("list", user=OWNER, chat="dm"),
+                         "This command is only available to the owner.")
+        self.assertEqual(self.calls, [])
+
+    def test_owner_from_autonomy_env(self):
+        with mock.patch.dict(os.environ, {"AUTONOMY_OWNER_ID": "777"}):
+            self.assertEqual(self.run_as("list", user="777", chat="dm"), "ok")
+            self.assertEqual(self.run_as("list", user=OWNER, chat="dm"),
+                             "This command is only available to the owner.")
+
+    def test_writes_outside_dm_say_where_the_output_goes(self):
+        note = "Note: this command's output is shown in the current chat."
+        for raw in ("close 1", "checked 1", "outcome 1 --value accepted",
+                    "add --key k", "doctor --fix"):
+            with self.subTest(raw=raw):
+                out = self.run_as(raw, user=OWNER, chat="group")
+                self.assertEqual(out.splitlines()[-1], note)
+                self.assertTrue(out.startswith("ok"))
+        for raw, chat in (("close 1", "dm"), ("list", "group"), ("doctor", "thread"),
+                          ("why", "group")):
+            with self.subTest(raw=raw, chat=chat):
+                self.assertEqual(self.run_as(raw, user=OWNER, chat=chat), "ok")
+        self.assertEqual(self.run_as("close 1"), "ok")  # CLI: no chat type, no note
+
+
+class ApplyValidation(Home):
+    """P2-B: the extra checks apply makes; every rejection writes nothing."""
+
+    def setUp(self):
+        super().setUp()
+        self.setup_owner()
+        self.a, self.b, self.c, self.d = (self.add(k) for k in ("a", "b", "c", "d"))
+        self.apply({"watermark": WM0})
+        self.before = self.snapshot()
+
+    def iso(self, offset_s: float) -> str:
+        return datetime.fromtimestamp(time.time() + offset_s, timezone.utc).isoformat()
+
+    def rejected(self, doc: dict, needle: str):
+        doc.setdefault("watermark", 1000.0)
+        out = self.apply(doc, ok=False)
+        self.assertIn(needle, out["error"])
+        self.assertEqual(self.snapshot(), self.before)
+
+    def nf(self, **over) -> dict:
+        f = {"key": "n", "why": "care", "kind": "k", "subject": "s", "revisit_at": "+1d"}
+        f.update(over)
+        return f
+
+    # 1. watermark
+    def test_watermark_cannot_move_backwards(self):
+        self.rejected({"watermark": WM0 - 0.5}, "watermark would move backwards")
+
+    def test_watermark_may_stay_or_advance(self):
+        self.apply({"watermark": WM0})
+        self.apply({"watermark": WM0 + 500})
+        out = self.apply({"watermark": WM0 + 400}, ok=False)
+        self.assertIn("watermark would move backwards", out["error"])
+
+    # 2. times in the future
+    def test_revisit_at_in_the_past(self):
+        self.rejected({"new_followups": [self.nf(revisit_at=self.iso(-3600))]}, "is in the past")
+
+    def test_revisit_at_now_is_allowed(self):
+        out = self.apply({"new_followups": [self.nf(revisit_at="now")], "watermark": WM0})
+        self.assertTrue(out["ok"])
+
+    def test_snooze_must_be_strictly_future(self):
+        for snooze in (self.iso(-60), time.time() - 1):
+            with self.subTest(snooze=snooze):
+                self.rejected({"decisions": [{"id": self.a, "action": "silent", "reason": "r",
+                                              "snooze": snooze}]}, "is not in the future")
+
+    # 3. why
+    def test_why_must_be_a_known_category(self):
+        self.rejected({"new_followups": [self.nf(why="love")]},
+                      "why must be care|utility|risk|curiosity")
+
+    def test_why_is_normalised_to_lowercase(self):
+        out = self.apply({"new_followups": [self.nf(why=" Curiosity ")], "watermark": WM0})
+        self.assertEqual(self.row(out["added"][0])["why"], "curiosity")
+
+    def test_add_checks_and_lowercases_why(self):
+        p = self.fu("add", "--key", "x", "--kind", "k", "--why", "love", "--subject", "s",
+                    "--revisit-at", "+1d", ok=False)
+        self.assertEqual(p.returncode, 2)
+        self.assertIn("why must be care|utility|risk|curiosity", json.loads(p.stdout)["error"])
+        self.assertEqual(self.snapshot(), self.before)
+        fid = json.loads(self.fu("add", "--key", "x", "--kind", "k", "--why", "RISK",
+                                 "--subject", "s", "--revisit-at", "+1d").stdout)["id"]
+        self.assertEqual(self.row(fid)["why"], "risk")
+
+    # 4. sent
+    def test_sent_at_most_three_distinct_ids(self):
+        self.rejected({"sent": {"ids": [self.a, self.b, self.c, self.d], "msg_id": "1"}},
+                      "at most 3")
+
+    def test_sent_duplicate_ids_are_collapsed(self):
+        out = self.apply({"sent": {"ids": [self.a, self.a, self.b, self.a], "msg_id": "1"},
+                          "watermark": WM0})
+        self.assertEqual(out["sent"], [self.a, self.b])
+        self.assertEqual(self.row(self.a)["sends"], 1)
+
+    def test_sent_id_must_be_active(self):
+        self.fu("close", str(self.a))
+        self.before = self.snapshot()
+        self.rejected({"sent": {"id": self.a, "msg_id": "1"}}, f"followup {self.a} is closed, not active")
+
+    def test_sent_id_must_exist(self):
+        self.rejected({"sent": {"id": 999, "msg_id": "1"}}, "no followup 999")
+
+    def test_sent_text_at_most_six_lines(self):
+        self.rejected({"sent": {"id": self.a, "msg_id": "1", "text": "l\n\n" * 7}},
+                      "7 lines; at most 6")
+        self.assertTrue(self.apply({"sent": {"id": self.a, "msg_id": "1", "text": "l\n\n" * 6},
+                                    "watermark": WM0})["ok"])
+
+    # 5. act_report / ask need a receipt
+    def test_act_report_without_receipt(self):
+        for action in ("act_report", "ask"):
+            with self.subTest(action=action):
+                self.rejected({"decisions": [{"id": self.a, "action": action, "reason": "r"}]},
+                              "act_report/ask without a send receipt")
+
+    def test_ask_with_earlier_receipt_or_receipt_in_doc(self):
+        c = self.db()
+        c.execute("UPDATE followups SET sent_msg_id='m-9' WHERE id=?", (self.a,))
+        c.commit()
+        out = self.apply({"decisions": [{"id": self.a, "action": "ask", "reason": "r"},
+                                        {"id": self.b, "action": "act_report", "reason": "r"}],
+                          "sent": {"id": self.b, "msg_id": "m-10"}, "watermark": WM0})
+        self.assertTrue(out["ok"])
+
+    # 6. close / outcome on a missing id
+    def test_close_and_outcome_missing_id_fail(self):
+        for args in (("close", "999"), ("outcome", "999", "--value", "accepted")):
+            with self.subTest(args=args):
+                p = self.fu(*args, ok=False)
+                self.assertEqual(p.returncode, 2, p.stdout)
+                self.assertEqual(json.loads(p.stdout), {"ok": False, "error": "no followup 999"})
+        self.assertEqual(self.snapshot(), self.before)
+        self.fu("close", str(self.a))
+        self.fu("outcome", str(self.b), "--value", "accepted")
+
+
+class SendTimeout(Home):
+    """P2-D: a timed-out `hermes send` may have delivered: cool down, do not mark sent."""
+
+    def setUp(self):
+        super().setUp()
+        self.setup_owner()
+        self.a = self.add("trip")
+        os.environ["HERMES_HOME"] = str(self.home)
+        os.environ["PATH"] = self.env["PATH"]
+        os.environ["AUTONOMY_TZ"] = self.tz
+        spec = importlib.util.spec_from_file_location("followups_send_timeout", FOLLOWUPS)
+        self.mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(self.mod)
+
+    def test_timeout_starts_cooldown_and_leaves_item_unsent(self):
+        import argparse
+        import contextlib
+        import io
+        body = self.home / "body.txt"
+        body.write_text("hello", encoding="utf-8")
+
+        def hang(cmd, **kw):
+            raise subprocess.TimeoutExpired(cmd, kw.get("timeout"))
+
+        buf = io.StringIO()
+        t0 = time.time()
+        with mock.patch.object(self.mod.subprocess, "run", hang), contextlib.redirect_stdout(buf):
+            rc = self.mod.cmd_send(argparse.Namespace(ids=str(self.a), text_file=str(body)))
+        self.assertEqual(rc, 3)
+        out = json.loads(buf.getvalue())
+        self.assertEqual((out["ok"], out["refused"], out["note"]),
+                         (False, "timeout", "message may have been delivered"))
+        r = self.row(self.a)
+        self.assertEqual((r["sent_at"], r["sent_msg_id"], r["sends"]), (None, None, 0))
+        last_send = float(self.db().execute("SELECT v FROM kv WHERE k='last_send'").fetchone()[0])
+        self.assertAlmostEqual(last_send, t0, delta=30)
+        # The cooldown now holds the next attempt instead of sending twice.
+        p = self.run_cli(FOLLOWUPS, "send", "--ids", str(self.a), stdin="hello")
+        self.assertEqual(p.returncode, 2)
+        self.assertEqual(json.loads(p.stdout)["refused"], "cooling")
+
+
+class NoAuthorPaths(unittest.TestCase):
+    """P2-C: shipped code resolves the plugin from HERMES_HOME or its own location."""
+
+    def test_cron_wrappers(self):
+        for name in ("followup-wake.py", "followup-digest.py"):
+            src = (ROOT / "cron" / name).read_text(encoding="utf-8")
+            with self.subTest(name=name):
+                self.assertNotIn('"opt"', src)
+                self.assertIn('home / "plugins" / "hermes-autonomous"', src)
+                self.assertIn("Path(__file__).resolve().parent.parent", src)
+
+    def test_review_prompt_plugin_root(self):
+        text = (ROOT / "prompts" / "review.md").read_text(encoding="utf-8")
+        self.assertIn("PLUGIN=${PLUGIN:-${HERMES_HOME:-$HOME/.hermes}/plugins/hermes-autonomous}",
+                      text)
+        self.assertNotIn("opt/hermes-autonomous", text)
+
+    def test_decide_needs_hermes_on_path(self):
+        src = (ROOT / "scripts" / "decide.py").read_text(encoding="utf-8")
+        self.assertIn('CHAT = shutil.which("hermes")\n', src)
+        self.assertNotIn("hermes-agent/.hermes", src)
+        scenario = ROOT / "scenarios" / "01-throat.json"
+        env = {k: v for k, v in os.environ.items() if k != "PATH"}
+        empty = tempfile.mkdtemp(prefix="empty-path-")
+        self.addCleanup(shutil.rmtree, empty, True)
+        env["PATH"] = empty
+        p = subprocess.run([sys.executable, str(ROOT / "scripts" / "decide.py"),
+                            "--scenario", str(scenario)],
+                           capture_output=True, text=True, env=env, timeout=30)
+        self.assertEqual(p.returncode, 2, p.stdout + p.stderr)
+        self.assertIn("hermes not found on PATH", p.stderr)

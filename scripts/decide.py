@@ -39,7 +39,7 @@ def local_tz():
             pass
     return datetime.now().astimezone().tzinfo or timezone.utc
 ROOT = Path(__file__).resolve().parent.parent
-CHAT = shutil.which("hermes") or str(Path.home() / ".hermes/hermes-agent/.hermes/bin/hermes")
+CHAT = shutil.which("hermes")
 
 
 def parse_now(s: str | None) -> datetime:
@@ -145,6 +145,10 @@ def main() -> int:
     ap.add_argument("--model", default="")
     ap.add_argument("--json", action="store_true", help="raw JSON result only")
     args = ap.parse_args()
+
+    if not CHAT:
+        print(json.dumps({"error": "hermes not found on PATH"}), file=sys.stderr)
+        return 2
 
     scenario = json.loads(Path(args.scenario).read_text(encoding="utf-8"))
     now = parse_now(scenario.get("now"))

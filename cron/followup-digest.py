@@ -12,7 +12,6 @@ from pathlib import Path
 home = Path(os.environ.get("HERMES_HOME") or (Path.home() / ".hermes"))
 candidates = [
     home / "plugins" / "hermes-autonomous" / "scripts" / "followups.py",
-    Path.home() / "opt" / "hermes-autonomous" / "scripts" / "followups.py",
     Path(__file__).resolve().parent.parent / "scripts" / "followups.py",
 ]
 target = next((p for p in candidates if p.exists()), None)

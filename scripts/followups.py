@@ -9,6 +9,7 @@ night — check the floor).
 Subcommands
 -----------
 digest [--hours N]     JSON for the review agent: new messages + active followups
+send --ids 12,15       DM the owner (body on stdin) if the send gate allows it; records the receipt
 add ...                create a followup
 list [--all]           show followups
 due [--at ISO]         only those whose revisit_at has arrived
@@ -85,8 +86,8 @@ def setting(key: str, env: str) -> str:
     return str(val)
 
 
-def _is_night() -> bool:
-    hour = datetime.now(tz=local_tz()).hour
+def _is_night(now: float | None = None) -> bool:
+    hour = datetime.fromtimestamp(time.time() if now is None else now, local_tz()).hour
     return hour < 8 or hour >= 23
 
 
@@ -162,8 +163,8 @@ def connect() -> sqlite3.Connection:
         );
         """
     )
-    # Migration: older DBs lack the delivery/outcome columns. `hermes send` output is
-    # not written back into state.db, so this table is the only receipt we have.
+    # Migration: older DBs lack the delivery/outcome columns. `hermes send` mirrors the
+    # text into the chat's session, but which followup it was for lives only here.
     cols = {r["name"] for r in conn.execute("PRAGMA table_info(followups)")}
     # sends / sent_text: how many times it actually went out and what was said last,
     # so the review can tell "sent once already" from "never sent". `checks` counts
@@ -284,6 +285,62 @@ def muted_whys(conn, now: float | None = None) -> dict[str, str]:
     return muted
 
 
+WHYS = ("care", "utility", "risk", "curiosity")
+
+
+def _norm_why(v) -> str | None:
+    """The category, lowercased, or None when it is not one of WHYS. Stored
+    lowercase so the mute check (an exact match on why) cannot be dodged by case."""
+    why = v.strip().lower() if isinstance(v, str) else ""
+    return why if why in WHYS else None
+
+
+SEND_COOLDOWN_S = 90 * 60
+SEND_MAX_IDS = 3
+SEND_MAX_LINES = 6
+SEND_TIMEOUT_S = 120
+# Due = the revisit time has come and nothing was sent since it was set.
+DUE_SQL = ("status='active' AND COALESCE(revisit_at,0)<=? "
+           "AND (sent_at IS NULL OR sent_at < revisit_at)")
+
+
+def _get_kv(conn, k: str, default: float = 0.0) -> float:
+    r = conn.execute("SELECT v FROM kv WHERE k=?", (k,)).fetchone()
+    try:
+        return float(r["v"]) if r else default
+    except (TypeError, ValueError):
+        return default
+
+
+def send_gate(conn, now: float | None = None) -> dict:
+    """The one decision on whether a DM may go out now. digest, wake and send all
+    call this; none of them re-derives night / cooldown / mute on its own.
+
+    held:     {id: "muted"|"night"|"cooling"} for due items that may not be sent
+    sendable: due ids nothing holds back, ascending
+    hold:     why nothing is sendable although something is due, else None
+    """
+    now = time.time() if now is None else now
+    night = _is_night(now)
+    cooling = (now - _get_kv(conn, "last_send", 0.0)) < SEND_COOLDOWN_S
+    muted = muted_whys(conn, now)
+    held: dict[int, str] = {}
+    sendable: list[int] = []
+    for r in conn.execute(f"SELECT id, why FROM followups WHERE {DUE_SQL} ORDER BY id", (now,)):
+        reason = ("muted" if r["why"] in muted else "night" if night
+                  else "cooling" if cooling else None)
+        if reason:
+            held[r["id"]] = reason
+        else:
+            sendable.append(r["id"])
+    hold = None
+    if held and not sendable:
+        reasons = set(held.values())
+        hold = next(x for x in ("night", "cooling", "muted") if x in reasons)
+    return {"now": now, "night": night, "cooling": cooling, "muted": muted,
+            "held": held, "sendable": sendable, "may_send": bool(sendable), "hold": hold}
+
+
 def cmd_digest(args) -> int:
     conn = connect()
     wm = since = _get_wm(conn)
@@ -291,20 +348,22 @@ def cmd_digest(args) -> int:
         since = max(since, time.time() - args.hours * 3600)
     msgs, last_ts = _messages_since(since)
     now = time.time()
-    active = [
-        {
+    gate = send_gate(conn, now)
+    active = []
+    for r in conn.execute("SELECT * FROM followups WHERE status='active' ORDER BY revisit_at").fetchall():
+        due = r["id"] in gate["held"] or r["id"] in gate["sendable"]
+        active.append({
             "id": r["id"], "key": r["key"], "kind": r["kind"], "why": r["why"],
             "subject": r["subject"], "quote": r["quote"], "hint": r["hint"],
             "revisit_at": _iso(r["revisit_at"]),
-            "due": (r["revisit_at"] or 0) <= now and not (r["sent_at"] and r["sent_at"] >= (r["revisit_at"] or 0)),
+            "due": due,
+            "held": r["id"] in gate["held"], "held_reason": gate["held"].get(r["id"]),
             "checks": r["checks"], "last_checked": _iso(r["last_checked"]),
             "status": r["status"],
             "sent_at": _iso(r["sent_at"]), "sent_msg_id": r["sent_msg_id"],
             "sends": r["sends"], "sent_text": (r["sent_text"] or "")[:MAX_SENT_TEXT_DIGEST],
             "outcome": r["outcome"],
-        }
-        for r in conn.execute("SELECT * FROM followups WHERE status='active' ORDER BY revisit_at").fetchall()
-    ]
+        })
     payload = {
         "now": _iso(now),
         "watermark": _iso(since),
@@ -316,18 +375,25 @@ def cmd_digest(args) -> int:
         "messages": msgs,
         "followups": active,
         "due_count": sum(1 for f in active if f["due"]),
-        "mode": "review" if any(f["due"] for f in active) else "capture",
-        "night": _is_night(),
-        "muted": muted_whys(conn, now),
+        "mode": "review" if gate["may_send"] else ("capture" if msgs else "quiet"),
+        "may_send": gate["may_send"],
+        "night": gate["night"],
+        "cooling": gate["cooling"],
+        "muted": gate["muted"],
         "dev_log": dev_log(),
-        "instructions": "See prompts/review.md: produce one apply JSON (watermark = next_watermark); "
-                        "to DM the owner, hermes send first, then write back with one followups.py apply.",
+        "instructions": "See prompts/review.md: to DM the owner use followups.py send (it gates and "
+                        "records the send), then write back with one followups.py apply "
+                        "(watermark = next_watermark).",
     }
     print(json.dumps(payload, ensure_ascii=False))
     return 0
 
 
 def cmd_add(args) -> int:
+    why = _norm_why(args.why)
+    if why is None:
+        print(json.dumps({"ok": False, "error": f"why must be {'|'.join(WHYS)}, got {args.why!r}"}))
+        raise SystemExit(2)
     conn = connect()
     cur = conn.execute(
         "INSERT INTO followups(key,kind,why,subject,quote,hint,revisit_at,created_at) "
@@ -335,7 +401,7 @@ def cmd_add(args) -> int:
         "why=excluded.why,subject=excluded.subject,quote=excluded.quote,"
         "hint=excluded.hint,revisit_at=excluded.revisit_at "
         "RETURNING id",
-        (args.key, args.kind, args.why, args.subject, args.quote, args.hint or "",
+        (args.key, args.kind, why, args.subject, args.quote, args.hint or "",
          _parse(args.revisit_at), time.time()),
     )
     print(json.dumps({"ok": True, "id": cur.fetchone()[0]}))
@@ -473,20 +539,151 @@ def cmd_sent(args) -> int:
     return 0
 
 
+def _send_refusal(conn, ids: list[int], text: str) -> tuple[str, str] | None:
+    """(reason, detail) when this DM must not go out; None when it may."""
+    gate = send_gate(conn)
+    if gate["night"]:
+        return "night", "no DMs between 23:00 and 08:00"
+    if gate["cooling"]:
+        return "cooling", f"a DM went out less than {SEND_COOLDOWN_S // 60} minutes ago"
+    rows = {r["id"]: r for r in conn.execute(
+        f"SELECT id, why, status FROM followups WHERE id IN ({','.join('?' * len(ids))})", ids)}
+    hit = sorted(i for i in ids if i in rows and rows[i]["why"] in gate["muted"])
+    if hit:
+        return "muted", f"ids {hit}: category muted by the owner's feedback"
+    for i in ids:
+        if i not in rows:
+            return "not_found", f"no followup {i}"
+        if rows[i]["status"] != "active":
+            return "not_active", f"followup {i} is {rows[i]['status']}"
+        if i not in gate["sendable"]:
+            return "not_due", f"followup {i} is not due (or was already sent)"
+    if len(ids) > SEND_MAX_IDS:
+        return "too_many_ids", f"{len(ids)} ids; at most {SEND_MAX_IDS} per DM"
+    if not text:
+        return "empty_text", "the message body is empty"
+    lines = [l for l in text.splitlines() if l.strip()]
+    if len(lines) > SEND_MAX_LINES:
+        return "too_many_lines", f"{len(lines)} lines; at most {SEND_MAX_LINES} (shorten it, nothing is cut)"
+    return None
+
+
+def _send_result(rc: int, out: str, err: str) -> tuple[str | None, str]:
+    """(message_id, "") on a real delivery, else (None, why). `hermes send --json`
+    exits 0 on success *and* on a skipped send; only a message_id proves delivery."""
+    doc = None
+    start = out.find("{")
+    if start >= 0:
+        try:
+            doc, _ = json.JSONDecoder().raw_decode(out[start:])
+        except ValueError:
+            doc = None
+    if not isinstance(doc, dict):
+        return None, f"hermes send exited {rc} without a JSON result: {_last_line(err, out)}"
+    if doc.get("error") or doc.get("success") is not True:
+        return None, f"hermes send failed: {doc.get('error') or 'success is not true'}"
+    if doc.get("skipped"):
+        return None, f"hermes send skipped it: {doc.get('reason') or doc.get('note') or 'no reason'}"
+    mid = str(doc.get("message_id") if doc.get("message_id") is not None else "").strip()
+    if not mid or mid in ("None", "null"):
+        return None, "hermes send reported success but no message_id"
+    if rc != 0:
+        return None, f"hermes send exited {rc}"
+    return mid, ""
+
+
+def cmd_send(args) -> int:
+    """Gate, deliver and record one DM. The receipt is committed right after the
+    send, in its own transaction, so it never waits on (or rolls back with) apply.
+    Re-running it for the same ids is refused: they are no longer due."""
+    def done(rc: int, **out) -> int:
+        print(json.dumps(out, ensure_ascii=False))
+        return rc
+
+    try:
+        ids = [int(x) for x in args.ids.split(",") if x.strip()]
+    except ValueError:
+        return done(2, ok=False, refused="bad_ids", detail=f"--ids must be like 12,15: {args.ids!r}")
+    if not ids or len(set(ids)) != len(ids):
+        return done(2, ok=False, refused="bad_ids", detail="--ids must list distinct ids")
+    try:
+        if args.text_file and args.text_file != "-":
+            text = Path(args.text_file).read_text(encoding="utf-8")
+        else:
+            text = "" if sys.stdin.isatty() else sys.stdin.read()
+    except OSError as e:
+        return done(2, ok=False, refused="empty_text", detail=f"cannot read the body: {e}")
+    text = text.strip()
+    try:
+        target = dm_target()
+    except SystemExit as e:
+        return done(2, ok=False, refused="not_configured", detail=str(e))
+
+    conn = connect()
+    # One send at a time: a second caller waits, then sees the ids no longer due.
+    lock = open(db_path().parent / "send.lock", "w")
+    try:
+        try:
+            import fcntl
+            fcntl.flock(lock, fcntl.LOCK_EX)
+        except ImportError:  # no flock (Windows): the not-due check still applies
+            pass
+        refusal = _send_refusal(conn, ids, text)
+        if refusal:
+            return done(2, ok=False, refused=refusal[0], detail=refusal[1])
+
+        rc, out, err = _hermes("send", "--to", target, "--json", "--file", "-",
+                               timeout=SEND_TIMEOUT_S, stdin=text)
+        if rc == 124:
+            # It may well have gone out; only the message_id is missing. Start the
+            # cooldown so the next run does not send it again at once, but leave the
+            # items unsent: nothing proves delivery.
+            _set_kv(conn, "last_send", time.time())
+            return done(3, ok=False, refused="timeout", note="message may have been delivered",
+                        ids=ids)
+        mid, why = _send_result(rc, out, err)
+        if mid is None:
+            return done(3, ok=False, error=why, ids=ids)
+
+        now = time.time()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            for fid in ids:
+                conn.execute("UPDATE followups SET sent_at=?, sent_msg_id=?, checks=checks+1, "
+                             "sends=sends+1, sent_text=?, revisit_at=? WHERE id=?",
+                             (now, mid, text[:MAX_SENT_TEXT], now + 86400, fid))
+            _set_kv(conn, "last_send", now)
+            conn.execute("COMMIT")
+        except Exception as e:  # noqa: BLE001 - delivered but unrecorded: say so loudly
+            if conn.in_transaction:
+                conn.execute("ROLLBACK")
+            return done(4, ok=False, error=f"sent but NOT recorded: {type(e).__name__}: {e}",
+                        msg_id=mid, ids=ids, text=text)
+        return done(0, ok=True, msg_id=mid, ids=ids, sent=len(ids))
+    finally:
+        lock.close()
+
+
 def cmd_outcome(args) -> int:
     conn = connect()
     if args.value not in ("accepted", "ignored", "annoyed", "useless", "unknown"):
         raise SystemExit("outcome must be accepted|ignored|annoyed|useless|unknown")
-    conn.execute("UPDATE followups SET outcome=? WHERE id=?", (args.value, args.id))
+    cur = conn.execute("UPDATE followups SET outcome=? WHERE id=?", (args.value, args.id))
+    if cur.rowcount == 0:
+        print(json.dumps({"ok": False, "error": f"no followup {args.id}"}))
+        raise SystemExit(2)
     print(json.dumps({"ok": True, "id": args.id, "outcome": args.value}))
     return 0
 
 
 def cmd_close(args) -> int:
     conn = connect()
-    conn.execute(
+    cur = conn.execute(
         "UPDATE followups SET status='closed', note=COALESCE(?,note) WHERE id=?", (args.note, args.id)
     )
+    if cur.rowcount == 0:
+        print(json.dumps({"ok": False, "error": f"no followup {args.id}"}))
+        raise SystemExit(2)
     print(json.dumps({"ok": True}))
     return 0
 
@@ -552,6 +749,12 @@ def _apply(conn, doc: dict) -> dict:
                 continue
             if not isinstance(f.get(k), str) or not f[k].strip():
                 raise ApplyError(f"{where}: missing {k}")
+        why = _norm_why(f["why"])
+        if why is None:
+            raise ApplyError(f"{where}: why must be {'|'.join(WHYS)}, got {f['why']!r}")
+        revisit = _when(f.get("revisit_at"), f"{where}.revisit_at")
+        if revisit < now:
+            raise ApplyError(f"{where}.revisit_at: {f.get('revisit_at')!r} is in the past")
         # Same upsert as `add`: sent_at / checks / outcome / status survive.
         row = conn.execute(
             "INSERT INTO followups(key,kind,why,subject,quote,hint,revisit_at,created_at) "
@@ -559,10 +762,42 @@ def _apply(conn, doc: dict) -> dict:
             "why=excluded.why,subject=excluded.subject,quote=excluded.quote,"
             "hint=excluded.hint,revisit_at=excluded.revisit_at "
             "RETURNING id",
-            (f["key"].strip(), f["kind"], f["why"], f["subject"], f.get("quote") or "",
-             f.get("hint") or "", _when(f.get("revisit_at"), f"{where}.revisit_at"), now),
+            (f["key"].strip(), f["kind"], why, f["subject"], f.get("quote") or "",
+             f.get("hint") or "", revisit, now),
         ).fetchone()
         res["added"].append(row[0])
+
+    # The receipt is validated before outcomes/close run, so "active" means active
+    # before this run, not after a close earlier in the same document.
+    sent = doc.get("sent")
+    sent_ids: list[int] = []
+    if sent is not None:
+        _obj(sent, "sent", ("id", "ids", "msg_id", "text"))
+        if ("id" in sent) == ("ids" in sent):
+            raise ApplyError("sent: give exactly one of id / ids")
+        raw_ids = sent["ids"] if "ids" in sent else [sent["id"]]
+        if not isinstance(raw_ids, list) or not raw_ids:
+            raise ApplyError("sent.ids: must be a non-empty list")
+        sent_ids = list(dict.fromkeys(_id(conn, v, "sent") for v in raw_ids))
+        if len(sent_ids) > SEND_MAX_IDS:
+            raise ApplyError(f"sent.ids: {len(sent_ids)} ids; at most {SEND_MAX_IDS} per message")
+        for fid in sent_ids:
+            st = conn.execute("SELECT status FROM followups WHERE id=?", (fid,)).fetchone()[0]
+            if st != "active":
+                raise ApplyError(f"sent: followup {fid} is {st}, not active")
+        # A send with no message_id is a failure: never record it as delivered.
+        msg_id = str(sent.get("msg_id") or "").strip()
+        if not msg_id:
+            raise ApplyError("sent.msg_id: required — the send failed, do not mark it sent")
+        sent_text = sent.get("text")
+        if sent_text is None:
+            sent_text = ""
+        if not isinstance(sent_text, str):
+            raise ApplyError("sent.text: must be a string (the message as sent)")
+        lines = [l for l in sent_text.splitlines() if l.strip()]
+        if len(lines) > SEND_MAX_LINES:
+            raise ApplyError(f"sent.text: {len(lines)} lines; at most {SEND_MAX_LINES}")
+        sent_text = sent_text[:MAX_SENT_TEXT]
 
     for i, o in enumerate(_list(doc, "outcomes")):
         where = f"outcomes[{i}]"
@@ -585,27 +820,6 @@ def _apply(conn, doc: dict) -> dict:
                      (c.get("note"), fid))
         res["closed"].append(fid)
 
-    sent = doc.get("sent")
-    sent_ids: list[int] = []
-    if sent is not None:
-        _obj(sent, "sent", ("id", "ids", "msg_id", "text"))
-        if ("id" in sent) == ("ids" in sent):
-            raise ApplyError("sent: give exactly one of id / ids")
-        raw_ids = sent["ids"] if "ids" in sent else [sent["id"]]
-        if not isinstance(raw_ids, list) or not raw_ids:
-            raise ApplyError("sent.ids: must be a non-empty list")
-        sent_ids = [_id(conn, v, "sent") for v in raw_ids]
-        # A send with no message_id is a failure: never record it as delivered.
-        msg_id = str(sent.get("msg_id") or "").strip()
-        if not msg_id:
-            raise ApplyError("sent.msg_id: required — the send failed, do not mark it sent")
-        sent_text = sent.get("text")
-        if sent_text is None:
-            sent_text = ""
-        if not isinstance(sent_text, str):
-            raise ApplyError("sent.text: must be a string (the message as sent)")
-        sent_text = sent_text[:MAX_SENT_TEXT]
-
     seen: set[int] = set()
     for i, d in enumerate(_list(doc, "decisions")):
         where = f"decisions[{i}]"
@@ -623,23 +837,42 @@ def _apply(conn, doc: dict) -> dict:
         if d.get("snooze") is not None and action != "silent":
             raise ApplyError(f"{where}: snooze only applies to action=silent")
         if action != "silent":
-            continue  # act_report / ask: the send receipt or a later outcome settles it
+            # act_report / ask means a message went out: `send` recorded it, or this
+            # document carries the receipt. Otherwise it is a claim with no proof.
+            prev = conn.execute("SELECT sent_msg_id FROM followups WHERE id=?", (fid,)).fetchone()[0]
+            if not (prev or "").strip() and fid not in sent_ids:
+                raise ApplyError(f"{where}: act_report/ask without a send receipt "
+                                 f"(followup {fid} was never sent)")
+            continue  # the send receipt or a later outcome settles it
         if fid in sent_ids:
             raise ApplyError(f"{where}: followup {fid} is marked silent but also sent")
         # Same as `checked`: always move revisit_at forward, or it stays due forever.
         checks = conn.execute("SELECT checks FROM followups WHERE id=?", (fid,)).fetchone()[0]
         backoff = min(86400 * (2 ** min(checks or 0, 3)), 7 * 86400)
-        nxt = _when(d["snooze"], f"{where}.snooze") if d.get("snooze") is not None else now + backoff
+        if d.get("snooze") is not None:
+            nxt = _when(d["snooze"], f"{where}.snooze")
+            if nxt <= now:
+                raise ApplyError(f"{where}.snooze: {d['snooze']!r} is not in the future")
+        else:
+            nxt = now + backoff
         conn.execute("UPDATE followups SET checks=checks+1, last_checked=?, revisit_at=? WHERE id=?",
                      (now, nxt, fid))
         res["checked"].append({"id": fid, "next": _iso(nxt)})
 
+    booked = False
     for fid in sent_ids:
+        # `followups.py send` already booked this message: a receipt passed back
+        # again (old prompts do) must not count it twice or restart the cooldown.
+        prev = conn.execute("SELECT sent_msg_id FROM followups WHERE id=?", (fid,)).fetchone()[0]
+        if prev == msg_id:
+            res.setdefault("already_recorded", []).append(fid)
+            continue
         conn.execute("UPDATE followups SET sent_at=?, sent_msg_id=?, checks=checks+1, "
                      "sends=sends+1, sent_text=?, revisit_at=? WHERE id=?",
                      (now, msg_id, sent_text, now + 86400, fid))
         res["sent"].append(fid)
-    if sent_ids:
+        booked = True
+    if booked:
         _set_kv(conn, "last_send", now)
 
     wm = doc.get("watermark")
@@ -647,6 +880,10 @@ def _apply(conn, doc: dict) -> dict:
         raise ApplyError("watermark: required, the raw next_watermark float from digest")
     if wm > now + 60:
         raise ApplyError(f"watermark: {wm} is in the future; it would skip messages")
+    cur_wm = conn.execute("SELECT last_ts FROM watermark WHERE surface='messages'").fetchone()
+    if cur_wm is not None and wm < cur_wm[0]:
+        raise ApplyError(f"watermark would move backwards: {wm} < current {cur_wm[0]}; "
+                         "it would replay messages")
     _set_wm(conn, float(wm))
     _set_kv(conn, "last_capture", now)
     res["watermark"] = float(wm)
@@ -778,13 +1015,15 @@ def _hermes_home() -> Path:
     return Path(os.environ.get("HERMES_HOME") or (Path.home() / ".hermes"))
 
 
-def _hermes(*args: str, timeout: float = 30) -> tuple[int, str, str]:
-    """(returncode, stdout, stderr); 127 = no hermes on PATH, 124 = timed out."""
+def _hermes(*args: str, timeout: float = 30, stdin: str | None = None) -> tuple[int, str, str]:
+    """(returncode, stdout, stderr); 127 = no hermes on PATH, 124 = timed out.
+    An argv list, never a shell: message bodies go in on ``stdin``."""
     exe = shutil.which("hermes")
     if not exe:
         return 127, "", "hermes not found on PATH"
     try:
-        p = subprocess.run([exe, *args], capture_output=True, text=True, timeout=timeout)
+        p = subprocess.run([exe, *args], capture_output=True, text=True, timeout=timeout,
+                           input=stdin if stdin is not None else "")
     except subprocess.TimeoutExpired:
         return 124, "", f"hermes {' '.join(args)} timed out"
     except OSError as e:
@@ -1047,6 +1286,11 @@ def main() -> int:
     se.add_argument("--msg-id", default="", help="message_id from `hermes send --json`")
     se.add_argument("--text", default="", help="the message body as sent")
     se.set_defaults(fn=cmd_sent)
+
+    sd = sub.add_parser("send")
+    sd.add_argument("--ids", required=True, help="followup ids covered by this DM, e.g. 12,15")
+    sd.add_argument("--text-file", default="-", help="message body (default: stdin)")
+    sd.set_defaults(fn=cmd_send)
 
     oc = sub.add_parser("outcome")
     oc.add_argument("id", type=int)

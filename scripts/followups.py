@@ -886,10 +886,12 @@ def _create_commands() -> list[str]:
     return [
         f"mkdir -p {shlex.quote(str(scripts))} && cp {shlex.quote(str(PLUGIN_DIR / 'cron'))}/*.py "
         f"{shlex.quote(str(scripts))}/",
-        _cmd(["hermes", "cron", "create", "*/15 * * * *", "--name", JOB_NAMES[0],
-              "--monitor-script", WAKE_SCRIPT, "--script", DIGEST_SCRIPT,
-              "--prompt", f"Read {PLUGIN_DIR / 'prompts' / 'review.md'} and follow it",
-              "--deliver", "local", "--failure-deliver", "origin"]),
+        # The prompt is positional on `hermes cron create`; --prompt is not a flag.
+        _cmd(["hermes", "cron", "create", "*/15 * * * *",
+              f"Read {PLUGIN_DIR / 'prompts' / 'review.md'} and follow it",
+              "--name", JOB_NAMES[0], "--monitor-script", WAKE_SCRIPT,
+              "--script", DIGEST_SCRIPT, "--deliver", "local",
+              "--failure-deliver", "origin"]),
     ]
 
 

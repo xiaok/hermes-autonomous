@@ -1058,6 +1058,17 @@ class Doctor(Home):
             (scripts / name).write_text("")
         (self.bin / "calls.jsonl").unlink(missing_ok=True)  # forget setup's own doctor run
 
+    def test_create_command_uses_a_positional_prompt(self):
+        # `hermes cron create` has no --prompt flag; the prompt is positional.
+        # A suggestion that cannot be pasted is worse than no suggestion.
+        spec = importlib.util.spec_from_file_location("followups_probe", FOLLOWUPS)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        cmd = mod._create_commands()[-1]
+        self.assertNotIn("--prompt", cmd)
+        self.assertIn("prompts/review.md", cmd)
+        self.assertLess(cmd.index("prompts/review.md"), cmd.index("--name"))
+
     def job(self, **over) -> dict:
         j = {"id": "a1b2c3", "name": "proactive follow-ups", "script": "followup-digest.py",
              "prompt": "Read /x/prompts/review.md and follow it",

@@ -29,10 +29,9 @@ hermes plugins install xiaok/hermes-autonomous --enable
 PLUGIN=~/.hermes/plugins/hermes-autonomous
 python3 $PLUGIN/scripts/followups.py setup --owner-id <your Telegram user id> --dm-target telegram:<chat_id>
 cp $PLUGIN/cron/*.py ~/.hermes/scripts/
-hermes cron create "*/15 * * * *" --name "proactive follow-ups" \
-  --monitor-script followup-wake.py --script followup-digest.py \
-  --prompt "Read $PLUGIN/prompts/review.md and follow it" \
-  --deliver local --failure-deliver origin
+hermes cron create "*/15 * * * *" "Read $PLUGIN/prompts/review.md and follow it" \
+  --name "proactive follow-ups" --monitor-script followup-wake.py \
+  --script followup-digest.py --deliver local --failure-deliver origin
 ```
 
 - **`--monitor-script` 是必需的。** 它是唤醒门；漏了它，就是每 15 分钟无条件跑一次 agent。

@@ -35,10 +35,9 @@ hermes plugins install xiaok/hermes-autonomous --enable
 PLUGIN=~/.hermes/plugins/hermes-autonomous
 python3 $PLUGIN/scripts/followups.py setup --owner-id <id> --dm-target telegram:<id>
 cp $PLUGIN/cron/*.py ~/.hermes/scripts/
-hermes cron create "*/15 * * * *" --name "proactive follow-ups" \
-  --monitor-script followup-wake.py --script followup-digest.py \
-  --prompt "Read $PLUGIN/prompts/review.md and follow it" \
-  --deliver local --failure-deliver origin
+hermes cron create "*/15 * * * *" "Read $PLUGIN/prompts/review.md and follow it" \
+  --name "proactive follow-ups" --monitor-script followup-wake.py \
+  --script followup-digest.py --deliver local --failure-deliver origin
 ```
 
 - **`--monitor-script` is required.** It is the wake gate; leave it out and the agent runs

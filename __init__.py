@@ -10,11 +10,21 @@ No hooks, no background threads, no network calls, no credentials.
 
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
 from pathlib import Path
 
 SCRIPT = Path(__file__).resolve().parent / "scripts" / "followups.py"
+
+
+def _hermes_home() -> str:
+    """The gateway's current profile home, so the helper reads the same board."""
+    try:
+        from hermes_constants import get_hermes_home
+        return str(get_hermes_home())
+    except Exception:  # noqa: BLE001 - outside Hermes, or an older Hermes
+        return os.environ.get("HERMES_HOME") or str(Path.home() / ".hermes")
 
 _USAGE = (
     "用法：/followups [list|due|why|log|doctor [--fix]|close <id>|checked <id>|outcome <id> --value …]\n"
@@ -37,8 +47,9 @@ def _followups_command(raw_args: str) -> str:
     cmd += args[1:]
 
     try:
+        env = {**os.environ, "HERMES_HOME": _hermes_home()}
         # doctor shells out to `hermes cron list/edit`; give it room.
-        proc = subprocess.run(cmd, capture_output=True, text=True,
+        proc = subprocess.run(cmd, capture_output=True, text=True, env=env,
                               timeout=120 if sub == "doctor" else 20)
     except Exception as exc:  # noqa: BLE001 - a chat command must never raise
         return f"读取失败：{type(exc).__name__}: {exc}"

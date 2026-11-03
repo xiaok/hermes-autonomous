@@ -157,7 +157,11 @@ The full teardown and the research numbers (the best models score ~66% F1 on "sh
 - **Shell**: `/followups` runs one local Python helper (`scripts/followups.py`) with
   `sys.executable`; the cron helpers are plain Python. The only `hermes` subprocess is `doctor`'s
   (also run once at the end of `setup`): `hermes cron list`, plus `hermes cron edit` on this plugin's
-  own job when you pass `--fix`. No hook, no background thread, no approval bypass.
+  own job when you pass `--fix`. During a review the agent itself uses its terminal tool to run
+  this plugin's helpers (`followups.py digest`, `followups.py apply`, …) and `hermes send` to
+  message you in your DM. The offline tool `scripts/decide.py` calls `hermes -z` for one
+  tool-less model call — only when you run it yourself. No hook, no background thread, no approval
+  bypass.
 - **Credentials**: none. Your Telegram ids live in the plugin's own `settings.json` (0600) — not in
   `.env`, `auth.json` or any keychain.
 - No telemetry, no analytics.

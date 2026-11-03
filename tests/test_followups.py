@@ -8,17 +8,21 @@ subprocess, the same way cron does. Standard library only:
 
 from __future__ import annotations
 
+import importlib.util
 import json
 import os
 import shutil
 import sqlite3
+import stat
 import subprocess
 import sys
 import tempfile
 import time
+import types
 import unittest
 from datetime import datetime, timezone
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parent.parent
 FOLLOWUPS = ROOT / "scripts" / "followups.py"
@@ -1137,6 +1141,89 @@ class Doctor(Home):
         self.assertIn("[WARN] cron", p.stderr)
         self.assertLessEqual(len([l for l in p.stderr.splitlines() if l.strip().startswith("[")]), 5)
         self.assertEqual(self.edits(), [])
+
+
+class DbMode(Home):
+    def path(self) -> Path:
+        return self.home / "plugin-data" / "hermes-autonomous" / "followups.db"
+
+    def test_new_db_is_0600(self):
+        self.fu("list")
+        self.assertEqual(stat.S_IMODE(self.path().stat().st_mode), 0o600)
+
+    def test_existing_0644_db_is_tightened(self):
+        self.fu("list")
+        self.path().chmod(0o644)
+        self.fu("list")
+        self.assertEqual(stat.S_IMODE(self.path().stat().st_mode), 0o600)
+
+
+def load_plugin():
+    spec = importlib.util.spec_from_file_location("hermes_autonomous_plugin", ROOT / "__init__.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+class PluginCommandHome(Home):
+    """/followups must hand the gateway's current profile home to its helper."""
+
+    def setUp(self):
+        super().setUp()
+        self.other = Path(tempfile.mkdtemp(prefix="hermes-other-"))
+        self.addCleanup(shutil.rmtree, self.other, True)
+        self.plugin = load_plugin()
+
+    def capture_env(self) -> dict:
+        seen = {}
+
+        def fake_run(cmd, **kw):
+            seen.update(kw.get("env") or {})
+            return subprocess.CompletedProcess(cmd, 0, "ok", "")
+
+        with mock.patch.object(self.plugin.subprocess, "run", fake_run):
+            self.assertEqual(self.plugin._followups_command("list"), "ok")
+        return seen
+
+    def fake_constants(self, home: Path):
+        return mock.patch.dict(sys.modules, {"hermes_constants": types.SimpleNamespace(
+            get_hermes_home=lambda: home)})
+
+    def test_prefers_hermes_constants_over_environ(self):
+        with mock.patch.dict(os.environ, {"HERMES_HOME": str(self.other)}), \
+                self.fake_constants(self.home):
+            env = self.capture_env()
+        self.assertEqual(env["HERMES_HOME"], str(self.home))
+        self.assertEqual(env.get("PATH"), os.environ.get("PATH"))  # rest is inherited
+
+    def test_falls_back_to_environ_without_hermes_constants(self):
+        with mock.patch.dict(os.environ, {"HERMES_HOME": str(self.other)}), \
+                mock.patch.dict(sys.modules, {"hermes_constants": None}):
+            env = self.capture_env()
+        self.assertEqual(env["HERMES_HOME"], str(self.other))
+
+    def test_falls_back_to_default_home(self):
+        environ = {k: v for k, v in os.environ.items() if k != "HERMES_HOME"}
+        with mock.patch.dict(os.environ, environ, clear=True), \
+                mock.patch.dict(sys.modules, {"hermes_constants": None}):
+            env = self.capture_env()
+        self.assertEqual(env["HERMES_HOME"], str(Path.home() / ".hermes"))
+
+    def test_real_helper_reads_current_profile_board(self):
+        self.add("only-in-current-profile")
+        with mock.patch.dict(os.environ, {"HERMES_HOME": str(self.other)}), \
+                self.fake_constants(self.home):
+            out = self.plugin._followups_command("list")
+        self.assertIn("only-in-current-profile", out)
+        self.assertFalse((self.other / "plugin-data" / "hermes-autonomous" / "followups.db").exists())
+
+
+class ReadmeDisclosure(unittest.TestCase):
+    def test_both_readmes_disclose_agent_shell_and_decider(self):
+        for name in ("README.md", "README.zh-CN.md"):
+            text = (ROOT / name).read_text(encoding="utf-8")
+            for needle in ("hermes send", "hermes -z", "followups.py apply", "scripts/decide.py"):
+                self.assertIn(needle, text, f"{name}: {needle}")
 
 
 if __name__ == "__main__":

@@ -133,7 +133,11 @@ def db_path() -> Path:
 
 
 def connect() -> sqlite3.Connection:
-    conn = sqlite3.connect(db_path(), timeout=30, isolation_level=None)
+    path = db_path()
+    conn = sqlite3.connect(path, timeout=30, isolation_level=None)
+    # The board holds quotes from private chats: owner-only, new or pre-existing.
+    if path.exists() and (path.stat().st_mode & 0o777) != 0o600:
+        os.chmod(path, 0o600)
     conn.row_factory = sqlite3.Row
     conn.executescript(
         """

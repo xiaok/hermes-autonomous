@@ -120,7 +120,7 @@ python3 $PLUGIN/scripts/followups.py doctor --fix
 - **读**：Hermes 的会话库 `~/.hermes/state.db`，只读，且只读属于你 user id 的会话：私聊里的用户与助手消息；群聊、话题（thread）、论坛话题（forum）与频道（channel）会话（含其他成员的消息）仅在打开 `include_groups` 后读取。不读其他文件。
 - **写**：只有自己的数据目录 `~/.hermes/plugin-data/hermes-autonomous/`（SQLite 跟进表 + `settings.json`，权限 0600）。
 - **网络**：插件代码本身不发任何请求。复盘时 agent 可能用 Hermes 自带工具查天气/价格/新闻——那是 Hermes 的流量，不是这个插件的。
-- **Shell**：`/followups` 只用 `sys.executable` 跑一个本地 Python 脚本；cron 那侧也是纯 Python。唯一会起 `hermes` 子进程的是 `doctor`（`setup` 结束时也会跑一次）：`hermes cron list`，加 `--fix` 时再对本插件自己的 job 跑 `hermes cron edit`。不注册 hook、没有后台线程、不绕过审批。
+- **Shell**：`/followups` 只用 `sys.executable` 跑一个本地 Python 脚本；cron 那侧也是纯 Python。唯一会起 `hermes` 子进程的是 `doctor`（`setup` 结束时也会跑一次）：`hermes cron list`，加 `--fix` 时再对本插件自己的 job 跑 `hermes cron edit`。复盘时 agent 会用它的终端工具执行本插件的 helper（`followups.py digest`、`followups.py apply` 等），并用 `hermes send` 把消息发到你的私聊。离线工具 `scripts/decide.py` 会调用 `hermes -z` 跑一次无工具的模型调用——仅当你主动运行它时。不注册 hook、没有后台线程、不绕过审批。
 - **凭据**：没有。Telegram id 存在插件自己的 `settings.json`（0600），不读 `.env`、`auth.json` 或钥匙串。
 - 无遥测、无统计上报。
 

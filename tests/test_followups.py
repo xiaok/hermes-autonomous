@@ -985,6 +985,30 @@ class SendCount(Home):
 class OldDbMigration(Home):
     """A followups.db from before sends/sent_text (and before sent_at/outcome)."""
 
+    def test_rows_sent_before_the_column_backfill_to_one(self):
+        path = self.home / "plugin-data" / "hermes-autonomous"
+        path.mkdir(parents=True)
+        c = sqlite3.connect(path / "followups.db")
+        c.executescript(
+            "CREATE TABLE followups (id INTEGER PRIMARY KEY AUTOINCREMENT, key TEXT UNIQUE,"
+            " kind TEXT, why TEXT, subject TEXT, quote TEXT, hint TEXT, revisit_at REAL,"
+            " status TEXT DEFAULT 'active', checks INTEGER DEFAULT 0, last_checked REAL,"
+            " note TEXT, created_at REAL, sent_at REAL, sent_msg_id TEXT);")
+        c.execute("INSERT INTO followups(key,why,subject,revisit_at,sent_at,sent_msg_id)"
+                  " VALUES('sent','care','s',?,?,?)", (time.time() + 3600, time.time() - 86400, "42"))
+        c.execute("INSERT INTO followups(key,why,subject,revisit_at)"
+                  " VALUES('never','care','s',?)", (time.time() + 3600,))
+        c.commit()
+        c.close()
+
+        self.setup_owner()  # migration + backfill
+        rows = {r["key"]: r["sends"] for r in self.db().execute("SELECT key,sends FROM followups")}
+        self.assertEqual(rows, {"sent": 1, "never": 0})
+        # idempotent
+        self.setup_owner()
+        rows = {r["key"]: r["sends"] for r in self.db().execute("SELECT key,sends FROM followups")}
+        self.assertEqual(rows, {"sent": 1, "never": 0})
+
     def test_old_db_gains_columns_with_defaults(self):
         path = self.home / "plugin-data" / "hermes-autonomous"
         path.mkdir(parents=True)
@@ -1067,6 +1091,26 @@ class DigestTruncationAndNoise(Home):
         texts = [m["text"] for m in self.digest()["messages"]]
         self.assertEqual(len(texts), 240)  # 20 noise dropped first, so nothing truncated
         self.assertEqual(texts[0], "m1")
+
+    def test_background_process_notices_are_not_user_messages(self):
+        # These arrive as role=user in the owner's DM. Counting them woke the
+        # agent to find "no user messages", and its log woke it again.
+        self.state_db([
+            (self.wm + 1, "user", "real question", OWNER),
+            (self.wm + 2, "user", "[IMPORTANT: Background process proc_1 completed normally (exit code 0).", OWNER),
+            (self.wm + 3, "user", "Background process proc_2 finished", OWNER),
+        ])
+        d = self.digest()
+        self.assertEqual([m["text"] for m in d["messages"]], ["real question"])
+
+    def test_wake_ignores_background_notices_only(self):
+        c = self.db()
+        c.execute("UPDATE kv SET v=? WHERE k='last_capture'", (str(time.time() - 3 * 3600),))
+        c.commit()
+        self.state_db([(self.wm + 5, "user",
+                        "[IMPORTANT: Background process proc_1 completed normally (exit code 0).", OWNER)])
+        self.assertEqual(self.digest()["messages"], [])
+        self.assertEqual(self.wake(), "quiet")
 
     def test_wake_ignores_compaction_only_traffic(self):
         # Wake and digest must agree on what counts as a new message: otherwise a
@@ -1553,8 +1597,11 @@ class Gate(Home):
     def mute(self, why: str):
         ts = time.time() - 86400
         c = self.db()
-        c.execute("INSERT INTO followups(key,kind,why,subject,status,sent_at,revisit_at,outcome)"
-                  " VALUES(?,?,?,?,?,?,?,?)", (f"m-{why}", "k", why, "s", "closed", ts,
+        # sends=1: a row with sent_at is a row that went out, and connect() now
+        # backfills that, so the fixture must start consistent or a refusal would
+        # look like a database change.
+        c.execute("INSERT INTO followups(key,kind,why,subject,status,sent_at,sends,revisit_at,outcome)"
+                  " VALUES(?,?,?,?,?,?,?,?,?)", (f"m-{why}", "k", why, "s", "closed", ts, 1,
                                                ts + 86400, "annoyed"))
         c.commit()
 
@@ -1971,8 +2018,8 @@ class WakeDigestAgree(Home):
     def mute(self, why: str):
         ts = time.time() - 86400
         c = self.db()
-        c.execute("INSERT INTO followups(key,kind,why,subject,status,sent_at,revisit_at,outcome)"
-                  " VALUES(?,?,?,?,?,?,?,?)", (f"m-{why}-{ts}", "k", why, "s", "closed", ts,
+        c.execute("INSERT INTO followups(key,kind,why,subject,status,sent_at,sends,revisit_at,outcome)"
+                  " VALUES(?,?,?,?,?,?,?,?,?)", (f"m-{why}-{ts}", "k", why, "s", "closed", ts, 1,
                                                ts + 86400, "annoyed"))
         c.commit()
 

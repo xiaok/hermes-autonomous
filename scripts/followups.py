@@ -123,6 +123,12 @@ NOISE = (
     "[INTERNAL NOTIFICATION",
     "[ASYNC DELEGATION",
     "[OUT-OF-BAND USER MESSAGE",
+    # Background-process notices are stored as role=user in the owner's DM, so
+    # without these the gate counts them as the owner speaking and wakes the
+    # agent to find "no user messages" — which then posts a log that wakes it
+    # again. Self-feeding wakeups, one per finished background job.
+    "[IMPORTANT:",
+    "Background process ",
 )
 
 
@@ -174,6 +180,22 @@ def connect() -> sqlite3.Connection:
                        ("sent_text", "TEXT NOT NULL DEFAULT ''")):
         if name not in cols:
             conn.execute(f"ALTER TABLE followups ADD COLUMN {name} {decl}")
+    # `sends` was added after the first installs, so rows sent before that migrate
+    # as sends=0 and the "already asked twice" / "event has passed" rules read them
+    # as never sent. One send is the safe floor: it cannot trigger a close that
+    # would not have happened, and it stops the same item being sent again as if
+    # it were the first time.
+    # One-shot repair for boards migrated by a version that only added the column:
+    # rows already sent stayed at sends=0, so the "asked twice already" rules read
+    # them as never sent. Guarded by a kv flag so it cannot keep rewriting rows.
+    if conn.execute("SELECT 1 FROM kv WHERE k='sends_backfilled'").fetchone() is None:
+        conn.execute(
+            "UPDATE followups SET sends=1 WHERE sends=0 AND ("
+            "(sent_at IS NOT NULL AND sent_at>0) OR "
+            "(sent_msg_id IS NOT NULL AND sent_msg_id<>''))"
+        )
+        conn.execute("INSERT INTO kv(k,v) VALUES('sends_backfilled',?)", (str(time.time()),))
+        conn.commit()
     return conn
 
 
